@@ -312,33 +312,37 @@ def build_friend_ack_tree_from_log(
             return False
         return (ack_sender == f1) or (ack_sender == f2)
 
-    # For each ACK sender, find best parent DATA within time window
+    # For each ACK, find the closest-in-time parent DATA that listed
+    # ack_sender as a friend and was sent within ack_window_ms before
+    # the ACK.  We want the LATEST such DATA across all senders (most
+    # recent = most likely the trigger).
     for (t_ack, ack_sender) in ack_events:
-        best = None  # (t_data, parent_sender)
+        best_t = -1
+        best_parent = None
         for parent_sender, evs in by_sender.items():
-            # Find the latest DATA by this parent at/before t_ack
-            # and where ack_sender is in its friend list.
+            # evs is sorted ascending by time; walk newest-first.
             for (t_data, s, f1, f2, _rcv) in reversed(evs):
                 if t_data > t_ack:
+                    # Future event; keep scanning older ones.
                     continue
                 if t_ack - t_data > ack_window_ms:
+                    # Too old; all remaining events for this sender are older.
                     break
                 if _is_friend(ack_sender, f1, f2):
-                    best = (t_data, parent_sender)
-                    break
-            if best is not None:
-                break
+                    if t_data > best_t:
+                        best_t = t_data
+                        best_parent = parent_sender
+                    break   # found the latest qualifying event for this sender
 
-        if best is None:
+        if best_parent is None:
             continue
 
-        parent_sender = best[1]
-        all_edges.append((parent_sender, ack_sender))
+        all_edges.append((best_parent, ack_sender))
         if ack_sender not in parent_map:
-            parent_map[ack_sender] = parent_sender
-        else:
-            # keep the earliest parent (first-parent tree)
-            pass
+            # First (earliest ACK) determines the primary parent for BFS layout.
+            parent_map[ack_sender] = best_parent
+        # all_edges always records every edge so the full propagation
+        # graph is available for the "show all paths" view.
 
     # Ensure origin exists as root (even if it has no children)
     parent_map.setdefault(origin_id, origin_id)
@@ -605,25 +609,9 @@ class TreeWindow(QMainWindow):
             txt = self.scene.addText(str(nid))
             txt.setPos(p.x() + r + 2, p.y() - r)
 
-        # Fit view
+        # Fit view after all items have been added.
         self.scene.setSceneRect(self.scene.itemsBoundingRect())
         self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
-
-        for a,b,bold in edges:
-            p1,p2=nodes[a],nodes[b]
-            line=QGraphicsLineItem(p1.x(),p1.y(),p2.x(),p2.y())
-            line.setPen(QPen(Qt.black,3 if bold else 1,
-                             Qt.SolidLine if bold else Qt.DashLine))
-            self.scene.addItem(line)
-
-        for nid,p in nodes.items():
-            r=16 if nid==rsu else 10
-            e=QGraphicsEllipseItem(p.x()-r,p.y()-r,2*r,2*r)
-            e.setBrush(QBrush(Qt.white))
-            e.setPen(QPen(Qt.black,2))
-            self.scene.addItem(e)
-            t=self.scene.addText(str(nid))
-            t.setPos(p.x()+r+2,p.y()-r)
 
 # ==========================================================
 # Main GUI
@@ -748,15 +736,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No log", "No log file loaded.")
             return
 
-        # Build edges from the log on demand
-        parent_map, all_edges, delivered, last_hop = (
-            build_friend_ack_tree_from_log(self.log_path, origin, msg)
-        )
-
-        # If the message wasn't created (strict), refuse (your rule)
-        # Here we check if origin is present as created in the table.
-        # If you stored a created-set, use it instead.
-        # Minimal check: origin==root and there is a row in messages_df.
         if self.messages_df is not None:
             ok = ((self.messages_df["origin_id"] == origin) &
                   (self.messages_df["msg_id"] == msg)).any()
@@ -768,28 +747,47 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-        # Choose which edges to render (tree vs all)
-        # For now: first-parent tree only.
+        parent_map, all_edges, delivered, last_hop = (
+            build_friend_ack_tree_from_log(self.log_path, origin, msg)
+        )
+
+        # Use all_edges so every propagation path is visible, including
+        # branches that never reached the RSU.
+        # Deduplicate edges (same (parent, child) pair may appear multiple
+        # times if a node sent several retries that all got ACKed).
+        seen_edges: set = set()
         edges_to_draw = []
-        for child, parent in parent_map.items():
-            if child == origin and parent == origin:
+        children: dict = {}
+
+        for (p, c) in all_edges:
+            key = (p, c)
+            if key in seen_edges or p == c:
                 continue
-            edges_to_draw.append((parent, child, False))
-
-        # Add RSU node if delivered
-        rsu_node = None
-        if delivered and last_hop is not None:
-            rsu_node = 999  # display-only
-            edges_to_draw.append((last_hop, rsu_node, True))
-
-        # Layout nodes by levels (BFS from origin)
-        nodes = {origin: QPointF(0, 0)}
-        levels = {origin: 0}
-        children = {}
-        for (p, c, _b) in edges_to_draw:
+            seen_edges.add(key)
+            # Bold edge = path that leads to or from the RSU delivery hop.
+            bold = delivered and last_hop is not None and (
+                c == last_hop or p == last_hop
+            )
+            edges_to_draw.append((p, c, bold))
             children.setdefault(p, []).append(c)
 
-        # BFS
+        # Ensure origin appears even when it has no outgoing edges.
+        if not edges_to_draw:
+            pass  # origin-only tree is fine
+
+        # RSU node: add only if delivery was confirmed.
+        rsu_node = None
+        if delivered and last_hop is not None:
+            rsu_node = 999   # display-only pseudo-node
+            rsu_edge_key = (last_hop, rsu_node)
+            if rsu_edge_key not in seen_edges:
+                edges_to_draw.append((last_hop, rsu_node, True))
+                children.setdefault(last_hop, []).append(rsu_node)
+
+        # --- Layout: BFS levels from origin ----------------------------
+        # level  -> Y axis (tree grows downward)
+        # sibling index -> X axis (siblings spread horizontally)
+        levels = {origin: 0}
         q = [origin]
         while q:
             u = q.pop(0)
@@ -798,100 +796,48 @@ class MainWindow(QMainWindow):
                     levels[v] = levels[u] + 1
                     q.append(v)
 
-        # Place nodes by level
-        level_nodes = {}
+        # Nodes reachable only via multi-parent edges may not be in BFS
+        # tree yet; assign them the level of their earliest-known parent.
+        for (p, c, _b) in edges_to_draw:
+            if c not in levels and p in levels:
+                levels[c] = levels[p] + 1
+
+        if rsu_node is not None and rsu_node not in levels:
+            levels[rsu_node] = max(levels.values()) + 1
+
+        # Group nodes by level; sort siblings for deterministic layout.
+        level_nodes: dict = {}
         for nid, lv in levels.items():
             level_nodes.setdefault(lv, []).append(nid)
-        if rsu_node is not None:
-            levels[rsu_node] = max(levels.values()) + 1
-            level_nodes.setdefault(levels[rsu_node], []).append(rsu_node)
 
-        for lv, nids in level_nodes.items():
-            nids.sort()
-            for i, nid in enumerate(nids):
-                nodes[nid] = QPointF( lv * 120, i * 140)
+        H_SPACING = 160   # horizontal gap between siblings (px)
+        V_SPACING = 120   # vertical gap between levels (px)
 
-        title = f"Message {origin}:{msg}"
+        nodes: dict = {}
+        for lv in sorted(level_nodes.keys()):
+            siblings = sorted(level_nodes[lv])
+            n = len(siblings)
+            # Centre siblings around x=0.
+            for i, nid in enumerate(siblings):
+                x = (i - (n - 1) / 2.0) * H_SPACING
+                y = lv * V_SPACING
+                nodes[nid] = QPointF(x, y)
+
+        title = f"Message {origin}:{msg:08X}  —  {'Delivered' if delivered else 'NOT delivered'}"
         win = TreeWindow(title, nodes, edges_to_draw, rsu_node)
         self._tree_windows.append(win)
         win.show()
 
-    def on_watchdog(self,ticket):
-        m=QMessageBox(self)
-        m.setText("This is taking too long. Continue?")
-        m.setStandardButtons(QMessageBox.Yes|QMessageBox.No)
-        cb=QCheckBox("Don't ask again")
+    def on_watchdog(self, ticket):
+        m = QMessageBox(self)
+        m.setText("Parsing is taking a long time. Continue?")
+        m.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        cb = QCheckBox("Don't ask again")
         m.setCheckBox(cb)
-        r=m.exec()
-        ticket.allow=(r==QMessageBox.Yes)
-        ticket.dont_ask_again=cb.isChecked()
+        r = m.exec()
+        ticket.allow = (r == QMessageBox.Yes)
+        ticket.dont_ask_again = cb.isChecked()
         ticket.release()
-        if not self.log_path:
-            QMessageBox.warning(self, "No log", "No log file loaded.")
-            return
-    
-        # Strict rule: only show messages that exist in the created table.
-        if self.messages_df is not None:
-            ok = ((self.messages_df["origin_id"] == origin) &
-                  (self.messages_df["msg_id"] == msg)).any()
-            if not ok:
-                QMessageBox.information(
-                    self, "Not created in log",
-                    "This message has no creation point in the log "
-                    "(sender==origin not observed). Ignored."
-                )
-                return
-    
-        parent_map, all_edges, delivered2, last_hop = (
-            build_friend_ack_tree_from_log(self.log_path, origin, msg, 2000)
-        )
-    
-        # Build edges for first-parent tree (dashed)
-        edges = []
-        children = {}
-        for child, parent in parent_map.items():
-            if child == origin and parent == origin:
-                continue
-            edges.append((parent, child, False))
-            children.setdefault(parent, []).append(child)
-    
-        # RSU node only if delivered
-        rsu_node = None
-        if delivered2 and last_hop is not None:
-            rsu_node = 999
-            edges.append((last_hop, rsu_node, True))
-            children.setdefault(last_hop, []).append(rsu_node)
-    
-        # Layout: BFS levels from origin
-        levels = {origin: 0}
-        q = [origin]
-        while q:
-            u = q.pop(0)
-            for v in children.get(u, []):
-                if v not in levels:
-                    levels[v] = levels[u] + 1
-                    q.append(v)
-    
-        # Guarantee at least origin node (non-empty window)
-        nodes = {origin: QPointF(0, 0)}
-    
-        # Group by level and place
-        level_nodes = {}
-        for nid, lv in levels.items():
-            level_nodes.setdefault(lv, []).append(nid)
-        if rsu_node is not None and rsu_node not in levels:
-            lv = max(levels.values()) + 1
-            levels[rsu_node] = lv
-            level_nodes.setdefault(lv, []).append(rsu_node)
-    
-        for lv in sorted(level_nodes.keys()):
-            row = sorted(level_nodes[lv])
-            for i, nid in enumerate(row):
-                nodes[nid] = QPointF(i * 160, lv * 120)
-    
-        win = TreeWindow(f"Message {origin}:{msg}", nodes, edges, rsu_node)
-        self._tree_windows.append(win)
-        win.show()
 
     def context_menu(self,pos):
         idx=self.table.indexAt(pos)
