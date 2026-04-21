@@ -1,0 +1,112 @@
+Title: System Design Document – GossipVANET Research Project
+Author: Boris Gor
+Degree/Pathway: Master of Engineering (Coursework), AUT
+Date: 21 Mar 2026
+Status: Working Draft (Research Project)
+
+1. Purpose and Scope
+This document describes the overall architecture, roles, data flows,
+and design constraints of the GossipVANET research project. The goal
+is to evaluate a lightweight, epidemic (gossip-based) dissemination
+approach for vehicular ad hoc networks (VANETs), with emphasis on
+delivery stability under high mobility and network fragmentation.
+
+2. Design Objectives
+- Stability of message delivery with frequently changing topology.
+- Lightweight node logic (no central controller, no heavy compute).
+- Robust emergency alert dissemination without guaranteed RSU coverage.
+- Bounded overhead (suppression, fan-out control, duplication control).
+- Implementable on constrained embedded platforms (Contiki-NG motes).
+
+3. Node Roles
+3.1 Mobile Node (Vehicle)
+- Emits periodic QUERY beacons with current EF (Emergency Flag) context.
+- Exchanges DATA (telemetry/metrics) with neighbors and RSU (if present).
+- Detects sudden-stop/emergency locally from motion metrics (LOC feed).
+- Issues EMERGENCY frames on local trigger; re-broadcasts received ones.
+- Maintains a small local registry of active emergencies (by origin).
+- Uses LED (red) for EF indication; behavior visible to the simulation script.
+
+3.2 RSU (Stationary Sink) – optional
+- Receives uploaded frames (DATA/EMERGENCY) for logging/ground truth.
+- Returns ACK to mobiles; presence is learned by mobiles (3-miss rule).
+- Is not required for mobile-to-mobile emergency dissemination.
+
+3.3 Script Engine (Cooja side, out-of-band)
+- Provides periodic LOC lines "LOC <id> <x_dm> <y_dm> <ts_ms>" per node.
+- Responds to "REQ_LOC" from mobiles, always addressing the requester.
+- May auto-stop a node when its LED is red (unless overridden by GO or
+  by a wrong-direction EF exception in experiment-specific scenarios).
+
+4. High-Level Architecture
+- Fully distributed, connectionless broadcast for control frames
+  (QUERY, EMERGENCY) with bounded fan-out and random jitter.
+- Optional unicast upload of locally generated DATA to RSU (when visible).
+- Deduplication cache prevents re-processing of already seen frames.
+- Carry buffer stores unsent frames for later RSU upload (opportunistic).
+
+5. Message Types (summary)
+- QUERY: mobile → neighbors (broadcast), contains EF flag + EF origin.
+- DATA:  mobile → RSU (unicast) or neighbors (gossip) with metrics.
+- EMERGENCY: mobile → neighbors (broadcast), emergency code + metrics.
+- ACK (RSU only): RSU → mobile (unicast), presence discovery + pacing.
+
+6. Emergency Semantics
+- Local trigger: sudden stop (standing still for ≥ STOP_MIN_MS with
+  manhattan delta ≤ STOP_THRESH_DM).
+- Multi-EF support: registry tracks multiple active emergencies by origin.
+- Finish condition: first motion event after a local EF, or receipt of
+  EF_FINISH from the origin (for foreign EF entries).
+- Suppression rule: a mobile that stands due to a foreign EF does not
+  issue its own EF while the foreign EF is active.
+
+7. Mobility/Timing Inputs
+- LOC lines provide (x_dm, y_dm, ts_ms) from simulation script.
+- Motion metrics: dx, dy, approx magnitude, v (dm/s), dir8 (0..7).
+- Periodic timers: query epoch, optional gossip data epoch, unicast retry.
+
+8. Functional Components (mobile)
+- Radio I/O: simple-udp, link-local all-nodes multicast for broadcast.
+- Dedup store: (origin_id, msg_id).
+- Carry ring: store serialized frames for later RSU upload.
+- EF registry: up to N entries {origin, code, tick}, LED reflects non-empty.
+- Metrics packer: x_dm, y_dm, v_dmps, dir8 for compact payloads.
+- Broadcast fan-out engine: configurable repeats with random jitter.
+- Unicast-with-retry: paced retransmissions for RSU uploads.
+
+9. Performance/Overhead Controls
+- Controlled fan-out count for EMERGENCY/DATA gossip.
+- Randomized jitter before re-broadcast to reduce collisions.
+- Deduplication to prevent broadcast storms and loops.
+- Optional parameterization per scenario (dense vs. sparse mobility).
+
+10. Reliability Measures
+- Opportunistic store-and-forward (carry) toward RSU when visible.
+- Flood-like convergence for emergency via bounded gossip.
+- No hard dependency on RSU for safety-critical dissemination.
+
+11. Constraints and Assumptions
+- 802.15.4 simulation (Cooja/Sky motes) with LOS-like propagation.
+- External mobility oracle (LOC) approximates vehicular motion.
+- No cryptographic security in scope (research-only prototype).
+- Energy modeling approximate (MSPSim timings).
+
+12. Experimentation Plan (at architecture level)
+- Baseline comparison under identical traces: Flooding, Trickle, RPL.
+- Scenarios: sparse/dense traffic; fragmentation; RSU presence/absence;
+  emergency braking near and far from RSU; wrong-direction EF exception.
+- Metrics: delivery ratio, latency, transmissions per delivered message,
+  convergence time for EF, robustness under partition/re-merge.
+
+13. Risks and Mitigations
+- Lost FINISH frames can keep EF latched; mitigated by registry logic
+  and scenario script controls (GO/LED monitoring).
+- Serial-line mixing in simulation; mitigated by strict addressing in
+  REQ_LOC path and parsers checking ID.
+
+14. Deliverables (system side)
+- Compilable mobile firmware (Contiki-NG).
+- Cooja simulation scripts and scenario configs.
+- Experimental logs and analysis notebooks/tables.
+- Project report chapter mapping to this design.
+``

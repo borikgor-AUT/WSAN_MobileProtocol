@@ -1,0 +1,11 @@
+CONTIKI_PROJECT = mbl rsu
+all: $(CONTIKI_PROJECT)
+
+# Pick lightweight stack: CSMA + IPv6 (no RPL)
+MAKE_MAC     = MAKE_MAC_CSMA
+MAKE_NET     = MAKE_NET_IPV6
+MAKE_ROUTING = MAKE_ROUTING_NULLROUTING
+
+CONTIKI = ../..
+include $(CONTIKI)/Makefile.include
+CFLAGS += -DWSAN_MAX_CLIENTS=90 -DPROJECT_CONF_H=\"project-conf.h\"

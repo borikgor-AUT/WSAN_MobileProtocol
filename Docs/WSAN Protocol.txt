@@ -1,0 +1,169 @@
+Title: Protocol Description – GossipVANET Research Project
+Author: Boris Gor
+Degree/Pathway: Master of Engineering (Coursework), AUT
+Date: 21 Mar 2026
+Status: Working Draft (Research Project)
+
+1. Terminology
+Origin ID       : 32-bit identifier of the sender (mobile or RSU).
+Target ID       : 32-bit identifier of the intended receiver (or broadcast).
+Msg ID          : 16-bit per-origin sequential ID (wrap allowed).
+EF (Emergency)  : Emergency code (1..254); 0 = NONE; 255 = FINISH.
+EF Registry     : Local table of active emergencies by origin.
+Metrics         : Compact tuple {x_dm:int16, y_dm:int16, v_dmps:uint16, dir8:uint8}.
+
+2. Transport
+- Link: IPv6 over 802.15.4 as provided by Contiki-NG (Cooja/Sky).
+- Broadcast: link-local all-nodes multicast address.
+- Unicast: IPv6 address of RSU learned via ACK.
+- Timers: random jitter (ms) applied before re-broadcast (fan-out > 1).
+
+3. Common Frame Envelope (WSAN-style header)
+Marker      : 3 bytes – "Mbl" for mobiles, "RSU" for RSU.
+Origin ID   : 4 bytes, uint32, little-endian unless stated otherwise.
+Msg Type    : 1 byte  (QUERY=0x01, DATA=0x02, EMERGENCY=0x03, ACK=0x04).
+Msg ID      : 2 bytes, uint16, per-origin sequential.
+Target ID   : 4 bytes, uint32 (WSAN_TGT_BROADCAST for broadcast frames).
+TS_ms       : 4 bytes, uint32 – sender timestamp (scenario time).
+PayloadLen  : 2 bytes, uint16.
+Payload     : variable (see sections below).
+CRC/Check   : (as per Contiki link layer; not defined at app layer).
+
+Note: Endianness is fixed per field in implementation; cross-check
+pack/unpack helpers for multi-byte fields written in BE/LE as noted.
+
+4. Message Types
+
+4.1 QUERY (broadcast)
+Purpose:
+- Periodic presence/heartbeat.
+- Piggyback the latest known EF context (flag + origin), if any.
+
+Payload (5 bytes):
+- EF_flag     : 1 byte   (0=NONE, 1..254=EF code, 255=FINISH)
+- EF_origin   : 4 bytes  (big-endian u32)
+
+Semantics:
+- On RX at a mobile:
+  - If EF_flag == 0: no change.
+  - If EF_flag == 255: remove EF entry for EF_origin (FINISH).
+  - Else: add or update EF entry {origin=EF_origin, code=EF_flag}.
+  - Update LED state from non-empty EF registry.
+
+Rebroadcast:
+- Not required for QUERY (fan-out=1). Nodes send their own QUERY
+  on local schedule; this avoids amplification.
+
+4.2 DATA (unicast to RSU or broadcast for gossip data)
+Purpose:
+- Report local metrics to RSU when visible.
+- Optionally gossip metrics to neighbors when RSU not visible.
+
+Payload (7 bytes):
+- Metrics: { x_dm:int16 LE, y_dm:int16 LE, v_dmps:uint16 LE, dir8:uint8 }.
+
+Semantics:
+- Unicast to RSU with paced retries (if RSU known and have_loc==true).
+- Gossip (broadcast with limited fan-out) when RSU not visible, to
+  enable opportunistic data muling.
+
+4.3 EMERGENCY (broadcast with controlled fan-out)
+Purpose:
+- Disseminate emergency conditions quickly and robustly.
+
+Payload (5 + 7 bytes):
+- Tag 'E','F','B','R' (4 bytes ASCII) to mark emergency block.
+- EF_code: 1 byte (1..254), 255 denotes FINISH.
+- Metrics: 7 bytes (same layout as in DATA).
+
+Semantics:
+- On TX (local trigger): send EMERGENCY(code≠FINISH) with metrics.
+- On RX:
+  - Update EF registry: add/update for code≠FINISH; remove on FINISH.
+  - Set LED ON if registry non-empty; OFF if empty (after FINISH/removal).
+  - Re-broadcast received EMERGENCY with bounded fan-out (N repeats,
+    randomized jitter between repeats).
+- FINISH TX/RX:
+  - Code=255 removes corresponding registry entry and may turn LED OFF.
+
+4.4 ACK (RSU only, unicast)
+Purpose:
+- Advertise RSU presence and pace carry flush.
+
+Payload:
+- Implementation-specific (may be empty at app level).
+Semantics:
+- On RX at a mobile:
+  - Record RSU IP and origin_id.
+  - Refresh "have_rsu" epoch (3-misses rule).
+  - Optionally start/continue carry flush to RSU.
+
+5. Motion and Emergency Detection (out-of-band LOC feed)
+The firmware consumes serial lines from the simulation script:
+- "LOC <id> <x_dm> <y_dm> <ts_ms>"
+Parser extracts id/x/y/ts for THIS node only. Motion metrics:
+- dx, dy; Manhattan = |dx| + |dy|; velocity v_dmps = approx(dm/s);
+- dir8 ∈ {E,NE,N,NW,W,SW,S,SE}.
+
+Local emergency trigger:
+- If Manhattan ≤ STOP_THRESH_DM for ≥ STOP_MIN_MS -> issue EF(code=1).
+- When motion resumes (Manhattan > STOP_THRESH_DM) -> issue FINISH (255).
+
+Suppression rule:
+- If node is standing due to foreign EF (registry contains any entry
+  with origin != self), do not issue a new local EF while foreign EF
+  remains active. If own EF already active, do not re-issue.
+
+6. Deduplication and Carry
+- Dedup table on (origin_id, msg_id) drops duplicates for all types.
+- Carry ring stores serialized frames (DATA/EMERGENCY) for later
+  upload to RSU; flushed when RSU visible.
+
+7. Broadcast Fan-Out and Jitter
+- For EMERGENCY and optionally for DATA gossip:
+  - Immediate send to all-nodes multicast.
+  - Remaining fan-out repeats (N-1) scheduled with random jitter in ms.
+- Fan-out and jitter are scenario parameters (dense vs sparse).
+
+8. RSU Visibility and Upload Policy
+- "have_rsu" flag set on ACK; cleared if 3 consecutive QUERY epochs
+  pass without an ACK (3-misses rule).
+- When have_rsu==true, attempt unicast DATA and carry flush pacing.
+
+9. LED Semantics (exposed for simulation control)
+- LED ON if EF registry non-empty; OFF if empty.
+- Script may freeze node while LED is ON (unless overridden).
+- After FINISH clears registry, LED goes OFF and script releases node.
+
+10. Error Handling (research-grade)
+- Frames failing parse are dropped silently.
+- Unknown msg types are ignored.
+- Registry bounded to a small fixed number of EF entries; oldest
+  replaced on overflow.
+
+11. Parameters (typical defaults)
+- STOP_THRESH_DM = 1 dm
+- STOP_MIN_MS    = 2000 ms
+- QUERY period   = scenario-defined (e.g., 1–3 s)
+- EMERGENCY fan-out = small integer (e.g., 2–3 repeats)
+- Jitter range   = implementation helper (tens of ms)
+- Dedup/Carry sizes = small rings (implementation constants)
+
+12. Security (out of scope for this project)
+- No authentication or encryption at app layer in this prototype.
+- Suitable only for controlled experiments.
+
+13. Interoperability Notes
+- Endianness is defined per-field; verify pack/unpack helpers.
+- Multicast scope is link-local all-nodes for simplicity in Cooja.
+- RSU identity learned from ACK; no global registry assumed.
+
+14. Compliance/Testing
+- Baselines under identical mobility: Flooding, Trickle, RPL.
+- Metrics: delivery ratio, latency, tx-per-delivered, EF convergence time.
+- Scenarios: sparse/dense, partitions, RSU in/out of sight, emergency near/far.
+
+15. Versioning
+- This protocol description is aligned with the research firmware
+  used in the current experiments and may evolve with the project.
+``
