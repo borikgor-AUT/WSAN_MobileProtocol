@@ -182,6 +182,45 @@ def parse_friends(payload: bytes) -> Optional[Tuple[int, int]]:
     f2 = int.from_bytes(payload[12:16], "big")
     return f1, f2
 
+def find_all_paths_to_rsu(start_node, edges_list, rsu_target):
+    """
+    Find all simple paths from start_node to rsu_target.
+
+    This function walks FORWARD along directed edges (parent -> child).
+    It may scan edges_list on each step (O(V*E)) which is fine for small
+    WSAN trees. It creates:
+      - paths: list of node lists, each representing a path
+      - visited: set used to prevent cycles
+    """
+    paths = []
+
+    def dfs(node, path, visited):
+        """
+        Depth-first traversal that follows parent->child edges.
+
+        Uses:
+          - edges_list as an edge source (parent, child, ...)
+          - visited to avoid cycles
+        """
+        if node == rsu_target:
+            paths.append(path[:])
+            return
+
+        visited.add(node)
+
+        for (parent, child, _) in edges_list:
+            if parent == node and child not in visited:
+                path.append(child)
+                dfs(child, path, visited)
+                path.pop()
+
+        visited.remove(node)
+
+    if rsu_target is not None:
+        dfs(start_node, [start_node], set())
+
+    return paths
+
 def build_friend_ack_tree_from_log(
     log_path: str,
     origin_id: int,
