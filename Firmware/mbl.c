@@ -1,5 +1,5 @@
 /*
- * WSAN Mobile mote (Contiki-NG, Sky/MSPSim)
+ * BGKP Mobile mote (Contiki-NG, Sky/MSPSim)
  *
  * Responsibilities:
  *  - Periodic REQ_LOC over UART1; parse "LOC id x y ts" replies.
@@ -12,11 +12,11 @@
  *  - Parse QUERY from other mobiles to absorb EF state.
  *  - Dedup + compact carry ring. Flush carry to RSU when RSU visible.
  *    Carry stores 21-byte records (not including platform-base padding) 
- *    and not full wire frames. The WSAN frame
- *    is rebuilt from the record at flush time using wsan_pack().
+ *    and not full wire frames. The BGKP frame
+ *    is rebuilt from the record at flush time using bgkp_pack().
  *  - Friend-by-ACK: maintain two long-lived friend slots.
  *    * Friends are included in every originated DATA.
- *    * Retransmit each originated DATA WSAN_FRIEND_RETRIES times total
+ *    * Retransmit each originated DATA BGKP_FRIEND_RETRIES times total
  *      (1 initial send + retries), driven by t_data_ack_window ctimer.
  *    * Frame is REBUILT for each retry so the current friend list is
  *      always included; msg_id and ts_ms are frozen at creation time.
@@ -39,32 +39,32 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include "wsan_common.h"
-#include "wsan_protocol.h"
+#include "bgkp_common.h"
+#include "bgkp_protocol.h"
 
 /* ------------------------------------------------------------------ */
 /*  Build-time feature flags                                           */
 /* ------------------------------------------------------------------ */
-#ifndef WSAN_DIAG
-#define WSAN_DIAG 0
+#ifndef BGKP_DIAG
+#define BGKP_DIAG 1
 #endif
 
 #ifndef FRIEND_LIST_MONITOR_ENABLED
-#define FRIEND_LIST_MONITOR_ENABLED 1
+#define FRIEND_LIST_MONITOR_ENABLED 0
 #endif
 
 #ifndef LOC_PRINT
 #define LOC_PRINT 0
 #endif
 
-#ifndef WSAN_METRIC_LOG_ENABLED
-#define WSAN_METRIC_LOG_ENABLED 0
+#ifndef BGKP_METRIC_LOG_ENABLED
+#define BGKP_METRIC_LOG_ENABLED 0
 #endif
 
 /*
  * FRIEND_MISS_LIMIT: consecutive per-message miss cycles before a
  * friend slot is cleared. One "miss" = one full originated DATA
- * message cycle (all WSAN_FRIEND_RETRIES sends) during which the
+ * message cycle (all BGKP_FRIEND_RETRIES sends) during which the
  * friend sent no ACK at all.
  */
 #ifndef FRIEND_MISS_LIMIT
@@ -111,7 +111,7 @@ ms_to_ticks_ceil(uint32_t ms)
 /*  Fan-out context (broadcast with jitter retries)                   */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    uint8_t  buf[WSAN_MAX_FRAME];
+    uint8_t  buf[BGKP_MAX_FRAME];
     uint16_t len;
     uint8_t  remaining;
     struct simple_udp_connection *udp;
@@ -137,7 +137,7 @@ start_broadcast_fanout(fanout_ctx_t *ctx,
 
     if(fanout <= 1) { ctx->remaining = 0; return; }
     ctx->remaining = (uint8_t)(fanout - 1);
-    ctimer_set(&ctx->timer, ms_to_ticks_ceil(wsan_rand_jitter_ms()),
+    ctimer_set(&ctx->timer, ms_to_ticks_ceil(bgkp_rand_jitter_ms()),
                fanout_cb, ctx);
 }
 
@@ -149,7 +149,7 @@ fanout_cb(void *ptr)
     simple_udp_sendto(ctx->udp, ctx->buf, ctx->len, &ctx->maddr);
     ctx->remaining--;
     if(ctx->remaining)
-        ctimer_set(&ctx->timer, ms_to_ticks_ceil(wsan_rand_jitter_ms()),
+        ctimer_set(&ctx->timer, ms_to_ticks_ceil(bgkp_rand_jitter_ms()),
                    fanout_cb, ctx);
 }
 
@@ -176,8 +176,8 @@ static uint32_t ack_epoch_last = 0;
 /* ------------------------------------------------------------------ */
 /*  Dedup & compact carry store                                        */
 /* ------------------------------------------------------------------ */
-static wsan_dedup_t dedup;
-static wsan_carry_t carry;
+static bgkp_dedup_t dedup;
+static bgkp_carry_t carry;
 static uint32_t     carry_evicted    = 0;
 static uint8_t      carry_flush_active = 0;
 
@@ -193,7 +193,7 @@ static int32_t  prev_y_dm      = 0;
 static uint8_t  have_pos       = 0;
 static uint32_t t_last_move_ms = 0;
 static uint16_t v_dmps         = 0;
-static uint8_t  dir8           = WSAN_DIR_UNK;
+static uint8_t  dir8           = BGKP_DIR_UNK;
 static uint8_t  ef_active      = 0;
 
 #define STOP_THRESH_DM  1       /* <= 1 dm displacement -> "still" */
@@ -210,17 +210,17 @@ static struct etimer t_loc;
 /* ------------------------------------------------------------------ */
 /*  Friend list (long-lived, persists across messages)                */
 /*                                                                    */
-/*  friend_id[]:   two friend OriginIDs, or WSAN_FRIEND_EMPTY.       */
+/*  friend_id[]:   two friend OriginIDs, or BGKP_FRIEND_EMPTY.       */
 /*  friend_miss[]: consecutive per-message miss counter per slot.     */
 /* ------------------------------------------------------------------ */
-static uint32_t friend_id[2]   = { WSAN_FRIEND_EMPTY, WSAN_FRIEND_EMPTY };
+static uint32_t friend_id[2]   = { BGKP_FRIEND_EMPTY, BGKP_FRIEND_EMPTY };
 static uint8_t  friend_miss[2] = { 0, 0 };
 
 /* ------------------------------------------------------------------ */
 /*  Originated-DATA retry context                                     */
 /*                                                                    */
 /*  Stores the frozen identity and metric snapshot for the current    */
-/*  originated DATA message. The WSAN frame is rebuilt for each retry */
+/*  originated DATA message. The BGKP frame is rebuilt for each retry */
 /*  from these fields plus the live friend_id[] — so retries always   */
 /*  carry the latest friend list while keeping msg_id and ts_ms       */
 /*  unchanged.                                                        */
@@ -248,7 +248,7 @@ static struct ctimer t_data_ack_window;
  * Promoted to friend_id[] only at the end of the ACK window.
  */
 static uint8_t  cand_seen  = 0;
-static uint32_t cand_id[2] = { WSAN_FRIEND_EMPTY, WSAN_FRIEND_EMPTY };
+static uint32_t cand_id[2] = { BGKP_FRIEND_EMPTY, BGKP_FRIEND_EMPTY };
 
 /* ------------------------------------------------------------------ */
 /*  EF LED                                                            */
@@ -304,7 +304,7 @@ ef_find(uint32_t origin)
 static void
 ef_add_or_update(uint32_t origin, uint8_t code)
 {
-    if(code == WSAN_EF_NONE || code == WSAN_EF_FINISH) return;
+    if(code == BGKP_EF_NONE || code == BGKP_EF_FINISH) return;
     int8_t idx = ef_find(origin);
     if(idx >= 0) {
         ef_tab[idx].code = code;
@@ -381,7 +381,7 @@ ihyp_dm(uint32_t adx, uint32_t ady)
 /* ------------------------------------------------------------------ */
 /*  pack_metrics()                                                    */
 /*  Write x,y,v,dir into the first 7 bytes of a DATA payload buffer. */
-/*  Layout is little-endian (matches wsan_data_payload_t fields).     */
+/*  Layout is little-endian (matches bgkp_data_payload_t fields).     */
 /* ------------------------------------------------------------------ */
 static void
 pack_metrics(uint8_t out[7])
@@ -406,44 +406,43 @@ pack_metrics(uint8_t out[7])
 static uint8_t
 friend_list_full(void)
 {
-    return (friend_id[0] != WSAN_FRIEND_EMPTY &&
-            friend_id[1] != WSAN_FRIEND_EMPTY) ? 1 : 0;
+    return (friend_id[0] != BGKP_FRIEND_EMPTY &&
+            friend_id[1] != BGKP_FRIEND_EMPTY) ? 1 : 0;
 }
 
 /* Write current friend_id[] values into a DATA payload struct. */
 static void
-friend_list_write(wsan_data_payload_t *pl)
+friend_list_write(bgkp_data_payload_t *pl)
 {
-    wsan_u32_be_write(pl->friend1_be, friend_id[0]);
-    wsan_u32_be_write(pl->friend2_be, friend_id[1]);
+    bgkp_u32_be_write(pl->friend1_be, friend_id[0]);
+    bgkp_u32_be_write(pl->friend2_be, friend_id[1]);
 }
 
 /* Extract friend IDs from a received DATA payload raw buffer. */
 static void
 friend_list_read(const uint8_t *pl, uint16_t pl_len, uint32_t out_f[2])
 {
-    out_f[0] = WSAN_FRIEND_EMPTY;
-    out_f[1] = WSAN_FRIEND_EMPTY;
-    if(pl == NULL || pl_len < sizeof(wsan_data_payload_t)) return;
-    out_f[0] = wsan_u32_be_read(&pl[8]);
-    out_f[1] = wsan_u32_be_read(&pl[12]);
+    out_f[0] = BGKP_FRIEND_EMPTY;
+    out_f[1] = BGKP_FRIEND_EMPTY;
+    if(pl == NULL || pl_len < sizeof(bgkp_data_payload_t)) return;
+    out_f[0] = bgkp_u32_be_read(&pl[8]);
+    out_f[1] = bgkp_u32_be_read(&pl[12]);
 }
 
-/*
+
 static uint8_t
 is_my_friend(uint32_t id)
 {
-    return (id != WSAN_FRIEND_EMPTY &&
+    return (id != BGKP_FRIEND_EMPTY &&
             (id == friend_id[0] || id == friend_id[1])) ? 1 : 0;
 }
-*/
 
 /*
 static uint8_t
 friend_list_contains_my_friend(const uint32_t rf[2])
 {
     for(int i = 0; i < 2; ++i) {
-        if(rf[i] == WSAN_FRIEND_EMPTY) continue;
+        if(rf[i] == BGKP_FRIEND_EMPTY) continue;
         if(rf[i] == friend_id[0] || rf[i] == friend_id[1]) return 1;
     }
     return 0;
@@ -453,6 +452,7 @@ friend_list_contains_my_friend(const uint32_t rf[2])
 /* ------------------------------------------------------------------ */
 /*  Candidate filtering                                               */
 /* ------------------------------------------------------------------ */
+/*
 static uint8_t
 dir_similar(uint8_t a, uint8_t b)
 {
@@ -461,23 +461,26 @@ dir_similar(uint8_t a, uint8_t b)
     if(d > 4) d = (uint8_t)(8u - d);
     return (d <= 1) ? 1 : 0;
 }
+*/ // Allow friends from the other dimension
 
 static uint8_t
 candidate_ok(const uint8_t *pl, uint16_t pl_len)
 {
-    if(pl == NULL || pl_len < sizeof(wsan_data_payload_t)) return 0;
+    if(friend_id[0] == BGKP_FRIEND_EMPTY &&
+       friend_id[1] == BGKP_FRIEND_EMPTY) return 1; // Allow first candidate
+    if(pl == NULL || pl_len < sizeof(bgkp_data_payload_t)) return 0;
     int16_t  sx  = (int16_t)((uint16_t)pl[0] | ((uint16_t)pl[1] << 8));
     int16_t  sy  = (int16_t)((uint16_t)pl[2] | ((uint16_t)pl[3] << 8));
     uint16_t sv  = (uint16_t)((uint16_t)pl[4] | ((uint16_t)pl[5] << 8));
-    uint8_t  sdir = pl[6];
+    // uint8_t  sdir = pl[6];
     int32_t  dx  = (int32_t)sx - loc_x_dm;
     int32_t  dy  = (int32_t)sy - loc_y_dm;
     uint32_t adx = (dx >= 0) ? (uint32_t)dx : (uint32_t)(-dx);
     uint32_t ady = (dy >= 0) ? (uint32_t)dy : (uint32_t)(-dy);
     uint16_t dv  = (sv > v_dmps) ? (sv - v_dmps) : (v_dmps - sv);
-    if(adx + ady > WSAN_FRIEND_DIST_DM) return 0;
-    if(dv        > WSAN_FRIEND_DV_DMPS) return 0;
-    if(!dir_similar(sdir, dir8))        return 0;
+    if(adx + ady > BGKP_FRIEND_DIST_DM) return 0;
+    if(dv        > BGKP_FRIEND_DV_DMPS) return 0;
+    // if(!dir_similar(sdir, dir8))        return 0; // Allow friends going the other way
     return 1;
 }
 
@@ -543,7 +546,7 @@ schedule_ack(const uip_ipaddr_t *dst,
     ack_ctx.acked_msg    = acked_msg;
     ack_ctx.in_use       = 1;
     ack_ctx.use_mcast = use_mcast;
-    ctimer_set(&ack_ctx.t, ms_to_ticks_ceil(wsan_rand_jitter_ms()),
+    ctimer_set(&ack_ctx.t, ms_to_ticks_ceil(bgkp_rand_jitter_ms()),
                ack_delay_cb, &ack_ctx);
 }
 
@@ -559,7 +562,7 @@ schedule_ack(const uip_ipaddr_t *dst,
 static uint16_t
 build_gossip_frame(uint8_t *buf, uint16_t cap)
 {
-    wsan_data_payload_t pl;
+    bgkp_data_payload_t pl;
     pl.x_dm     = dctx.x_dm;
     pl.y_dm     = dctx.y_dm;
     pl.v_dmps   = dctx.v_dmps;
@@ -568,20 +571,20 @@ build_gossip_frame(uint8_t *buf, uint16_t cap)
     pl.ttl8     = dctx.ttl8;
     friend_list_write(&pl);   /* always from live friend_id[] */
 
-    wsan_fields_t f;
+    bgkp_fields_t f;
     memset(&f, 0, sizeof(f));
     f.marker[0]   = 'M'; f.marker[1] = 'b'; f.marker[2] = 'l';
     f.sender_id   = origin_id;
     f.origin_id   = origin_id;
-    f.msg_type    = WSAN_MSG_DATA;
+    f.msg_type    = BGKP_MSG_DATA;
     f.msg_id      = dctx.msg_id;   /* frozen */
-    f.target_id   = WSAN_TGT_BROADCAST;
+    f.target_id   = BGKP_TGT_BROADCAST;
     f.payload     = (const uint8_t *)&pl;
     f.payload_len = (uint16_t)sizeof(pl);
     f.ts_ms       = dctx.ts_ms;    /* frozen */
 
     uint16_t out_len = 0;
-    if(!wsan_pack(&f, buf, cap, &out_len)) return 0;
+    if(!bgkp_pack(&f, buf, cap, &out_len)) return 0;
     return out_len;
 }
 
@@ -591,33 +594,33 @@ build_gossip_frame(uint8_t *buf, uint16_t cap)
 /*  Store a compact record into the carry ring.                       */
 /*  If the ring is full, the oldest slot is gossip-broadcast before   */
 /*  being overwritten (best-effort delivery on eviction).             */
-/*  wsan_carry_put() handles the ring mechanics.                      */
+/*  bgkp_carry_put() handles the ring mechanics.                      */
 /* ------------------------------------------------------------------ */
 
 /*
  * carry_build_and_gossip_slot()
  * What:  Rebuild a wire frame from a carry slot and broadcast it once.
  *        Used to gossip-send the slot that is about to be evicted.
- * Methods: wsan_pack() + start_broadcast_fanout().
- * Creates: local buf and wsan_fields_t.
+ * Methods: bgkp_pack() + start_broadcast_fanout().
+ * Creates: local buf and bgkp_fields_t.
  */
 static void
-carry_build_and_gossip_slot(const wsan_carry_slot_t *s)
+carry_build_and_gossip_slot(const bgkp_carry_slot_t *s)
 {
-    uint8_t buf[WSAN_MAX_FRAME];
+    uint8_t buf[BGKP_MAX_FRAME];
     uint16_t out_len = 0;
-    wsan_fields_t f;
+    bgkp_fields_t f;
     memset(&f, 0, sizeof(f));
     f.marker[0] = 'M'; f.marker[1] = 'b'; f.marker[2] = 'l';
     f.sender_id   = origin_id;   /* we are the physical forwarder */
     f.origin_id   = s->origin_id;
-    f.target_id   = WSAN_TGT_BROADCAST;
+    f.target_id   = BGKP_TGT_BROADCAST;
     f.msg_id      = s->msg_id;
     f.ts_ms       = s->ts_ms;
 
-    if(s->msg_type == WSAN_MSG_DATA) {
-        f.msg_type = WSAN_MSG_DATA;
-        wsan_data_payload_t pl;
+    if(s->msg_type == BGKP_MSG_DATA) {
+        f.msg_type = BGKP_MSG_DATA;
+        bgkp_data_payload_t pl;
         pl.x_dm     = s->x_dm;
         pl.y_dm     = s->y_dm;
         pl.v_dmps   = s->v_dmps;
@@ -625,15 +628,15 @@ carry_build_and_gossip_slot(const wsan_carry_slot_t *s)
         pl.rssi_dbm = s->rssi_dbm;
         pl.ttl8     = s->ttl8; /* Preserve creator TTL; eviction is not a hop */
         /* No friend list in evicted gossip — use EMPTY. */
-        wsan_u32_be_write(pl.friend1_be, WSAN_FRIEND_EMPTY);
-        wsan_u32_be_write(pl.friend2_be, WSAN_FRIEND_EMPTY);
+        bgkp_u32_be_write(pl.friend1_be, BGKP_FRIEND_EMPTY);
+        bgkp_u32_be_write(pl.friend2_be, BGKP_FRIEND_EMPTY);
         f.payload     = (const uint8_t *)&pl;
         f.payload_len = (uint16_t)sizeof(pl);
-        if(wsan_pack(&f, buf, sizeof(buf), &out_len))
+        if(bgkp_pack(&f, buf, sizeof(buf), &out_len))
             start_broadcast_fanout(&data_fanout_ctx, &udp, buf, out_len, 1);
 
-    } else if(s->msg_type == WSAN_MSG_EMERGENCY) {
-        f.msg_type = WSAN_MSG_EMERGENCY;
+    } else if(s->msg_type == BGKP_MSG_EMERGENCY) {
+        f.msg_type = BGKP_MSG_EMERGENCY;
         uint8_t pl[12] = { 'E', 'F', 'B', 'R', s->ef_code };
         /* Pack metrics in little-endian after the EFBR+code header. */
         pl[5]  = (uint8_t)(s->x_dm & 0xFF);
@@ -645,7 +648,7 @@ carry_build_and_gossip_slot(const wsan_carry_slot_t *s)
         pl[11] = s->dir8;
         f.payload     = pl;
         f.payload_len = sizeof(pl);
-        if(wsan_pack(&f, buf, sizeof(buf), &out_len))
+        if(bgkp_pack(&f, buf, sizeof(buf), &out_len))
             start_broadcast_fanout(&ef_fanout_ctx, &udp, buf, out_len, 1);
     }
 }
@@ -655,11 +658,11 @@ carry_build_and_gossip_slot(const wsan_carry_slot_t *s)
  * What:  Print one diagnostic line before a slot is overwritten.
  */
 static void
-carry_log_evict(const wsan_carry_slot_t *s)
+carry_log_evict(const bgkp_carry_slot_t *s)
 {
-#if WSAN_METRIC_LOG_ENABLED
+#if BGKP_METRIC_LOG_ENABLED
     if(!s || !s->in_use) return;
-    const char *mtype = (s->msg_type == WSAN_MSG_DATA) ? "DATA" : "EF";
+    const char *mtype = (s->msg_type == BGKP_MSG_DATA) ? "DATA" : "EF";
     printf("MBL_RM type=EVICT mtype=%s origin=%lu msg=%lu "
            "x=%ld y=%ld v=%u dir=%u ts=%lu\n",
            mtype,
@@ -686,20 +689,20 @@ carry_store(uint8_t  msg_type,
             int8_t   rssi,    uint8_t  ttl8,
             uint8_t  ef_code)
 {
-    if(carry.count >= WSAN_CARRY_MAX_ITEMS) {
+    if(carry.count >= BGKP_CARRY_MAX_ITEMS) {
         /* Evict the slot at head (oldest in ring). */
         uint16_t idx = carry.head;
-        wsan_carry_slot_t *old = &carry.slots[idx];
+        bgkp_carry_slot_t *old = &carry.slots[idx];
         if(old->in_use) {
             carry_build_and_gossip_slot(old);
             carry_log_evict(old);
             carry_evicted++;
         }
     }
-    wsan_carry_put(&carry, msg_type, origin, msg_id, ts_ms,
+    bgkp_carry_put(&carry, msg_type, origin, msg_id, ts_ms,
                    x_dm, y_dm, v, dir, rssi, ttl8, ef_code);
 
-#if WSAN_DIAG
+#if BGKP_DIAG
     printf("%lu,CARRY_PUT,origin=%lu,msg=%lu,count=%u\n",
            (unsigned long)clock_seconds(),
            (unsigned long)origin, (unsigned long)msg_id,
@@ -710,9 +713,9 @@ carry_store(uint8_t  msg_type,
 /* ------------------------------------------------------------------ */
 /*  carry_flush: rebuild wire frames and send to RSU                  */
 /*                                                                    */
-/*  Each in_use slot is serialized via wsan_pack() and unicast to     */
-/*  the RSU. The RSU parses it with the standard wsan_parse() and     */
-/*  ACKs it; the ACK handler calls wsan_carry_ack() to free the slot. */
+/*  Each in_use slot is serialized via bgkp_pack() and unicast to     */
+/*  the RSU. The RSU parses it with the standard bgkp_parse() and     */
+/*  ACKs it; the ACK handler calls bgkp_carry_ack() to free the slot. */
 /* ------------------------------------------------------------------ */
 typedef struct {
     struct simple_udp_connection *udp;
@@ -727,22 +730,22 @@ static carry_flush_ctx_t cflush;
 static uint8_t
 carry_has_pending(void)
 {
-    for(uint16_t i = 0; i < WSAN_CARRY_MAX_ITEMS; ++i)
+    for(uint16_t i = 0; i < BGKP_CARRY_MAX_ITEMS; ++i)
         if(carry.slots[i].in_use) return 1;
     return 0;
 }
 
 /*
  * carry_build_frame_for_rsu()
- * What:  Rebuild a full WSAN wire frame from a compact carry slot,
+ * What:  Rebuild a full BGKP wire frame from a compact carry slot,
  *        targeted at the RSU (unicast, SenderID = self, OriginID = creator).
  * Returns serialized length or 0 on error.
  */
 static uint16_t
-carry_build_frame_for_rsu(const wsan_carry_slot_t *s,
+carry_build_frame_for_rsu(const bgkp_carry_slot_t *s,
                            uint8_t *buf, uint16_t cap)
 {
-    wsan_fields_t f;
+    bgkp_fields_t f;
     memset(&f, 0, sizeof(f));
     f.marker[0] = 'M'; f.marker[1] = 'b'; f.marker[2] = 'l';
     f.sender_id   = origin_id;      /* physical sender = this node */
@@ -751,9 +754,9 @@ carry_build_frame_for_rsu(const wsan_carry_slot_t *s,
     f.ts_ms       = s->ts_ms;
     f.target_id   = rsu_id;
 
-    if(s->msg_type == WSAN_MSG_DATA) {
-        f.msg_type = WSAN_MSG_DATA;
-        wsan_data_payload_t pl;
+    if(s->msg_type == BGKP_MSG_DATA) {
+        f.msg_type = BGKP_MSG_DATA;
+        bgkp_data_payload_t pl;
         pl.x_dm     = s->x_dm;
         pl.y_dm     = s->y_dm;
         pl.v_dmps   = s->v_dmps;
@@ -761,13 +764,13 @@ carry_build_frame_for_rsu(const wsan_carry_slot_t *s,
         pl.rssi_dbm = s->rssi_dbm;
         pl.ttl8     = s->ttl8; /* Preserve creator TTL; flush is not a hop */
         /* Friend list not needed for RSU delivery; send as EMPTY. */
-        wsan_u32_be_write(pl.friend1_be, WSAN_FRIEND_EMPTY);
-        wsan_u32_be_write(pl.friend2_be, WSAN_FRIEND_EMPTY);
+        bgkp_u32_be_write(pl.friend1_be, BGKP_FRIEND_EMPTY);
+        bgkp_u32_be_write(pl.friend2_be, BGKP_FRIEND_EMPTY);
         f.payload     = (const uint8_t *)&pl;
         f.payload_len = (uint16_t)sizeof(pl);
 
-    } else if(s->msg_type == WSAN_MSG_EMERGENCY) {
-        f.msg_type = WSAN_MSG_EMERGENCY;
+    } else if(s->msg_type == BGKP_MSG_EMERGENCY) {
+        f.msg_type = BGKP_MSG_EMERGENCY;
         static uint8_t ef_pl[12];  /* static: avoid stack pressure */
         ef_pl[0] = 'E'; ef_pl[1] = 'F'; ef_pl[2] = 'B'; ef_pl[3] = 'R';
         ef_pl[4] = s->ef_code;
@@ -785,7 +788,7 @@ carry_build_frame_for_rsu(const wsan_carry_slot_t *s,
     }
 
     uint16_t out_len = 0;
-    if(!wsan_pack(&f, buf, cap, &out_len)) return 0;
+    if(!bgkp_pack(&f, buf, cap, &out_len)) return 0;
     return out_len;
 }
 
@@ -797,18 +800,18 @@ carry_flush_cb(void *ptr)
     carry_flush_ctx_t *cf = (carry_flush_ctx_t *)ptr;
 
     while(cf->left > 0) {
-        uint16_t i = (uint16_t)(cf->idx % WSAN_CARRY_MAX_ITEMS);
+        uint16_t i = (uint16_t)(cf->idx % BGKP_CARRY_MAX_ITEMS);
         cf->idx++;
         cf->left--;
 
-        wsan_carry_slot_t *s = &carry.slots[i];
+        bgkp_carry_slot_t *s = &carry.slots[i];
         if(!s->in_use) continue;
 
-        uint8_t buf[WSAN_MAX_FRAME];
+        uint8_t buf[BGKP_MAX_FRAME];
         uint16_t len = carry_build_frame_for_rsu(s, buf, sizeof(buf));
         if(len == 0) continue;
 
-#if WSAN_DIAG
+#if BGKP_DIAG
         printf("%lu,CARRY_TX,slot=%u,left=%u,bytes=%u\n",
                (unsigned long)clock_seconds(),
                (unsigned)i, (unsigned)cf->left, (unsigned)len);
@@ -819,7 +822,7 @@ carry_flush_cb(void *ptr)
     }
 
     /* Scan done: if no slots remain, reset the ring counters. */
-    if(!carry_has_pending()) wsan_carry_init(&carry);
+    if(!carry_has_pending()) bgkp_carry_init(&carry);
     carry_flush_active = 0;
 }
 
@@ -832,7 +835,7 @@ start_carry_flush(void)
     cflush.udp  = &udp;
     cflush.dest = rsu_ip;
     cflush.idx  = 0;
-    cflush.left = WSAN_CARRY_MAX_ITEMS;
+    cflush.left = BGKP_CARRY_MAX_ITEMS;
     carry_flush_active = 1;
     carry_flush_cb(&cflush);
 }
@@ -846,7 +849,7 @@ start_carry_flush(void)
 /*     Candidates are ignored when both slots are already full        */
 /*     (in practice this cannot happen: a full-list sender gets no    */
 /*     ACKs from non-friends, so cand_seen will be 0).                */
-/*  2. If more sends remain (retry_count < WSAN_FRIEND_RETRIES):      */
+/*  2. If more sends remain (retry_count < BGKP_FRIEND_RETRIES):      */
 /*     rebuild the frame with the current friend list, send, reschedule.*/
 /*  3. After the last window: evaluate miss counters per friend slot;  */
 /*     remove a friend only when miss >= FRIEND_MISS_LIMIT.           */
@@ -861,7 +864,7 @@ data_ack_window_cb(void *ptr)
     /* Step 1: promote candidates into empty friend slots. */
     if(!friend_list_full()) {
         for(int i = 0; i < 2 && i < (int)cand_seen; ++i) {
-            if(friend_id[i] == WSAN_FRIEND_EMPTY)
+            if(friend_id[i] == BGKP_FRIEND_EMPTY)
                 friend_id[i] = cand_id[i];
         }
     }
@@ -872,7 +875,7 @@ data_ack_window_cb(void *ptr)
            (unsigned long)origin_id,
            (unsigned long)dctx.msg_id,
            (unsigned)dctx.retry_count,
-           (unsigned)WSAN_FRIEND_RETRIES,
+           (unsigned)BGKP_FRIEND_RETRIES,
            (unsigned)dctx.ack_mask,
            (unsigned)cand_seen,
            (unsigned long)friend_id[0],
@@ -881,24 +884,28 @@ data_ack_window_cb(void *ptr)
 #endif
 */
     /* Step 2: more transmissions needed? */
-    if(dctx.retry_count < WSAN_FRIEND_RETRIES) {
-        uint8_t buf[WSAN_MAX_FRAME];
+    if(dctx.retry_count < BGKP_FRIEND_RETRIES) {
+        uint8_t buf[BGKP_MAX_FRAME];
         uint16_t out_len = build_gossip_frame(buf, sizeof(buf));
         if(out_len > 0)
             start_broadcast_fanout(&data_fanout_ctx, &udp, buf, out_len, 1);
         dctx.retry_count++;
         ctimer_set(&t_data_ack_window,
-                   ms_to_ticks_ceil((WSAN_JITTER_MS+(WSAN_JITTER_MS >> 1))),
+                   ms_to_ticks_ceil((BGKP_JITTER_MS+(BGKP_JITTER_MS >> 1))),
                    data_ack_window_cb, NULL);
 #if FRIEND_LIST_MONITOR_ENABLED
-                   printf("MBL: Restarting ACK wait window (#%lu) for MsgID=%lu.\n", (unsigned long)dctx.retry_count, (unsigned long)dctx.msg_id);
+                   printf("MBL: Restarting ACK wait window (#%lu) for MsgID=%lu.\nFriends: %lu and %lu.\n",
+                          (unsigned long)dctx.retry_count,
+                          (unsigned long)dctx.msg_id,
+                          (unsigned long)friend_id[0]+1,
+                          (unsigned long)friend_id[1]+1);
 #endif
         return;
     }
 
     /* Step 3: final window — evaluate friend misses. */
     for(int i = 0; i < 2; ++i) {
-        if(friend_id[i] == WSAN_FRIEND_EMPTY) {
+        if(friend_id[i] == BGKP_FRIEND_EMPTY) {
             friend_miss[i] = 0;
             continue;
         }
@@ -924,7 +931,7 @@ data_ack_window_cb(void *ptr)
                        (unsigned long)friend_id[i]);
 #endif
 */
-                friend_id[i]   = WSAN_FRIEND_EMPTY;
+                friend_id[i]   = BGKP_FRIEND_EMPTY;
                 friend_miss[i] = 0;
             }
         }
@@ -933,14 +940,14 @@ data_ack_window_cb(void *ptr)
     /* Step 4: reset retry state. */
 
 #if FRIEND_LIST_MONITOR_ENABLED
-    printf("MBL: Stopped waiting (%u times) for ACK for MsgID=%lu.",(unsigned)dctx.retry_count,(unsigned long)dctx.msg_id);
+    printf("MBL: Stopped waiting (%u times) for ACK for MsgID=%lu.\n",(unsigned)dctx.retry_count,(unsigned long)dctx.msg_id);
 #endif
 
     dctx.active   = 0;
     dctx.ack_mask = 0;
     cand_seen     = 0;
-    cand_id[0]    = WSAN_FRIEND_EMPTY;
-    cand_id[1]    = WSAN_FRIEND_EMPTY;
+    cand_id[0]    = BGKP_FRIEND_EMPTY;
+    cand_id[1]    = BGKP_FRIEND_EMPTY;
 }
 
 /* ------------------------------------------------------------------ */
@@ -955,27 +962,31 @@ send_ack_unicast(const uip_ipaddr_t *dst,
                  uint32_t acked_msg)
 {
     (void)dst;  // Multicast ACK
-    wsan_fields_t f;
+    bgkp_fields_t f;
     memset(&f, 0, sizeof(f));
     f.marker[0] = 'M'; f.marker[1] = 'b'; f.marker[2] = 'l';
     f.sender_id   = origin_id;
     f.origin_id   = origin_id;
-    f.msg_type    = WSAN_MSG_ACK;
-    f.msg_id      = wsan_make_msgid(&seq16);
+    f.msg_type    = BGKP_MSG_ACK;
+    f.msg_id      = bgkp_make_msgid(&seq16);
     f.target_id   = target_id;
     f.ts_ms       = ts_ms;
 
     uint8_t pl[9];
     pl[0] = acked_type;
-    wsan_u32_be_write(&pl[1], acked_origin);
-    wsan_u32_be_write(&pl[5], acked_msg);
+    bgkp_u32_be_write(&pl[1], acked_origin);
+    bgkp_u32_be_write(&pl[5], acked_msg);
     f.payload     = pl;
     f.payload_len = sizeof(pl);
 
-    uint8_t buf[WSAN_MAX_FRAME];
+    uint8_t buf[BGKP_MAX_FRAME];
     uint16_t out_len = 0;
-    if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
+    if(!bgkp_pack(&f, buf, sizeof(buf), &out_len)) return;
     simple_udp_sendto(&udp, buf, out_len, dst);
+
+#if FRIEND_LIST_MONITOR_ENABLED
+            printf("MBL: ACKing DIRECTLY MsgID=%lu from mote#%lu.\n",(unsigned long)acked_msg, (unsigned long)target_id);
+#endif
     
 }
 
@@ -986,30 +997,35 @@ send_ack_mcast(uint32_t target_id,
                uint32_t acked_origin,
                uint32_t acked_msg)
 {
-    wsan_fields_t f;
+    bgkp_fields_t f;
     memset(&f, 0, sizeof(f));
     f.marker[0] = 'M'; f.marker[1] = 'b'; f.marker[2] = 'l';
     f.sender_id   = origin_id;
     f.origin_id   = origin_id;
-    f.msg_type    = WSAN_MSG_ACK;
-    f.msg_id      = wsan_make_msgid(&seq16);
+    f.msg_type    = BGKP_MSG_ACK;
+    f.msg_id      = bgkp_make_msgid(&seq16);
     f.target_id   = target_id;
     f.ts_ms       = ts_ms;
 
     uint8_t pl[9];
     pl[0] = acked_type;
-    wsan_u32_be_write(&pl[1], acked_origin);
-    wsan_u32_be_write(&pl[5], acked_msg);
+    bgkp_u32_be_write(&pl[1], acked_origin);
+    bgkp_u32_be_write(&pl[5], acked_msg);
     f.payload     = pl;
     f.payload_len = (uint16_t)sizeof(pl);
 
-    uint8_t buf[WSAN_MAX_FRAME];
+    uint8_t buf[BGKP_MAX_FRAME];
     uint16_t out_len = 0;
-    if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
+    if(!bgkp_pack(&f, buf, sizeof(buf), &out_len)) return;
 
     uip_ipaddr_t maddr;
     uip_create_linklocal_allnodes_mcast(&maddr);
     simple_udp_sendto(&udp, buf, out_len, &maddr);
+
+#if FRIEND_LIST_MONITOR_ENABLED
+            printf("MBL: ACKing BROADCAST MsgID=%lu from mote#%lu.\n",(unsigned long)acked_msg, (unsigned long)target_id);
+#endif
+
 }
 
 /* ------------------------------------------------------------------ */
@@ -1018,14 +1034,14 @@ send_ack_mcast(uint32_t target_id,
 static void
 send_emergency(uint8_t ef_code)
 {
-    wsan_fields_t f;
+    bgkp_fields_t f;
     memset(&f, 0, sizeof(f));
     f.marker[0] = 'M'; f.marker[1] = 'b'; f.marker[2] = 'l';
     f.sender_id   = origin_id;
     f.origin_id   = origin_id;
-    f.msg_type    = WSAN_MSG_EMERGENCY;
-    f.msg_id      = wsan_make_msgid(&seq16);
-    f.target_id   = WSAN_TGT_BROADCAST;
+    f.msg_type    = BGKP_MSG_EMERGENCY;
+    f.msg_id      = bgkp_make_msgid(&seq16);
+    f.target_id   = BGKP_TGT_BROADCAST;
     f.ts_ms       = last_ts_ms;
 
     uint8_t pl[12] = { 'E', 'F', 'B', 'R', ef_code };
@@ -1033,12 +1049,12 @@ send_emergency(uint8_t ef_code)
     f.payload     = pl;
     f.payload_len = sizeof(pl);
 
-    uint8_t buf[WSAN_MAX_FRAME];
+    uint8_t buf[BGKP_MAX_FRAME];
     uint16_t out_len = 0;
-    if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
+    if(!bgkp_pack(&f, buf, sizeof(buf), &out_len)) return;
 
-#if WSAN_METRIC_LOG_ENABLED
-    if(ef_code != WSAN_EF_FINISH)
+#if BGKP_METRIC_LOG_ENABLED
+    if(ef_code != BGKP_EF_FINISH)
         printf("Emergency Issued: id=%lu code=%u\n",
                (unsigned long)origin_id, (unsigned)ef_code);
     else
@@ -1054,10 +1070,10 @@ send_emergency(uint8_t ef_code)
            (unsigned long)last_ts_ms);
 #endif
 
-    start_broadcast_fanout(&ef_fanout_ctx, &udp, buf, out_len, WSAN_FANOUT_EF);
+    start_broadcast_fanout(&ef_fanout_ctx, &udp, buf, out_len, BGKP_FANOUT_EF);
 
-    if(!wsan_carry_exists(&carry, f.origin_id, f.msg_id))
-        carry_store(WSAN_MSG_EMERGENCY,
+    if(!bgkp_carry_exists(&carry, f.origin_id, f.msg_id))
+        carry_store(BGKP_MSG_EMERGENCY,
                     f.origin_id, f.msg_id, f.ts_ms,
                     (int16_t)loc_x_dm, (int16_t)loc_y_dm,
                     v_dmps, dir8, 0, 0, ef_code);
@@ -1103,7 +1119,7 @@ parse_loc_line(const char *line)
         prev_x_dm = loc_x_dm = xdm;
         prev_y_dm = loc_y_dm = ydm;
         t_last_move_ms = ts;
-        v_dmps = 0; dir8 = WSAN_DIR_UNK;
+        v_dmps = 0; dir8 = BGKP_DIR_UNK;
         have_pos = 1;
         return 1;
     }
@@ -1116,8 +1132,8 @@ parse_loc_line(const char *line)
     prev_x_dm = loc_x_dm; prev_y_dm = loc_y_dm;
     loc_x_dm  = xdm;      loc_y_dm  = ydm;
 
-    uint8_t nd = wsan_dir_from_delta(dx, dy);
-    if(nd != WSAN_DIR_UNK) dir8 = nd;
+    uint8_t nd = bgkp_dir_from_delta(dx, dy);
+    if(nd != BGKP_DIR_UNK) dir8 = nd;
 
     uint32_t dt_ms = (ts >= prev_ts) ? (ts - prev_ts) : 0;
     if(dt_ms == 0) dt_ms = 1;
@@ -1127,7 +1143,7 @@ parse_loc_line(const char *line)
     if(man > STOP_THRESH_DM) {
         t_last_move_ms = ts;
         if(ef_active) {
-            send_emergency(WSAN_EF_FINISH);
+            send_emergency(BGKP_EF_FINISH);
             ef_active = 0;
             ef_led_set(0);
             ef_remove(origin_id);
@@ -1144,7 +1160,7 @@ parse_loc_line(const char *line)
                         if(ef_tab[i].in_use && ef_tab[i].origin != origin_id)
                             { foreign = 1; break; }
                     if(foreign) {
-#if WSAN_METRIC_LOG_ENABLED
+#if BGKP_METRIC_LOG_ENABLED
                         printf("EF_SUPPRESSED: id=%lu (foreign EF active)\n",
                                (unsigned long)origin_id);
 #endif
@@ -1166,7 +1182,7 @@ parse_loc_line(const char *line)
 /*  Unicast DATA to RSU with ctimer retries                           */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    uint8_t  buf[WSAN_MAX_FRAME];
+    uint8_t  buf[BGKP_MAX_FRAME];
     uint16_t len;
     uint8_t  remaining;
     struct simple_udp_connection *udp;
@@ -1184,7 +1200,7 @@ unicast_retry_cb(void *ptr)
     simple_udp_sendto(c->udp, c->buf, c->len, &c->dest);
     c->remaining--;
     if(c->remaining)
-        ctimer_set(&c->timer, ms_to_ticks_ceil(wsan_rand_jitter_ms()),
+        ctimer_set(&c->timer, ms_to_ticks_ceil(bgkp_rand_jitter_ms()),
                    unicast_retry_cb, c);
 }
 
@@ -1201,7 +1217,7 @@ start_unicast_with_retries(struct simple_udp_connection *conn,
     simple_udp_sendto(uctx.udp, uctx.buf, uctx.len, &uctx.dest);
     if(retries_total <= 1) { uctx.remaining = 0; return; }
     uctx.remaining = (uint8_t)(retries_total - 1);
-    ctimer_set(&uctx.timer, ms_to_ticks_ceil(wsan_rand_jitter_ms()),
+    ctimer_set(&uctx.timer, ms_to_ticks_ceil(bgkp_rand_jitter_ms()),
                unicast_retry_cb, &uctx);
 }
 
@@ -1211,31 +1227,31 @@ start_unicast_with_retries(struct simple_udp_connection *conn,
 static void
 send_query(void)
 {
-    wsan_fields_t f;
+    bgkp_fields_t f;
     memset(&f, 0, sizeof(f));
     f.marker[0] = 'M'; f.marker[1] = 'b'; f.marker[2] = 'l';
     f.sender_id   = origin_id;
     f.origin_id   = origin_id;
-    f.msg_type    = WSAN_MSG_QUERY;
-    f.msg_id      = wsan_make_msgid(&seq16);
-    f.target_id   = WSAN_TGT_BROADCAST;
+    f.msg_type    = BGKP_MSG_QUERY;
+    f.msg_id      = bgkp_make_msgid(&seq16);
+    f.target_id   = BGKP_TGT_BROADCAST;
     f.ts_ms       = last_ts_ms;
 
     uint8_t qpl[5];
     uint32_t ef_orig = 0; uint8_t ef_flag = 0;
     if(!ef_get_last(&ef_orig, &ef_flag)) { ef_orig = 0; ef_flag = 0; }
     qpl[0] = ef_flag;
-    wsan_u32_be_write(&qpl[1], ef_orig);
+    bgkp_u32_be_write(&qpl[1], ef_orig);
     f.payload     = qpl;
     f.payload_len = sizeof(qpl);
 
-    uint8_t buf[WSAN_MAX_FRAME];
+    uint8_t buf[BGKP_MAX_FRAME];
     uint16_t out_len = 0;
-    if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
+    if(!bgkp_pack(&f, buf, sizeof(buf), &out_len)) return;
     fanout_ctx_t tmp;
     start_broadcast_fanout(&tmp, &udp, buf, out_len, 1);
 
-#if WSAN_DIAG
+#if BGKP_DIAG
     printf("%lu,QUERY,ef=%u,ef_orig=%lu\n",
            (unsigned long)clock_seconds(),
            (unsigned)ef_flag, (unsigned long)ef_orig);
@@ -1252,34 +1268,34 @@ send_data_unicast_to_rsu(void)
 {
     if(!have_rsu || !have_loc) return;
 
-    wsan_data_payload_t pl;
+    bgkp_data_payload_t pl;
     pack_metrics((uint8_t *)&pl);
     pl.rssi_dbm = 0;
     friend_list_write(&pl);
-    pl.ttl8 = WSAN_DATA_TTL_DEFAULT;
+    pl.ttl8 = BGKP_DATA_TTL_DEFAULT;
 
-    wsan_fields_t f;
+    bgkp_fields_t f;
     memset(&f, 0, sizeof(f));
     f.marker[0] = 'M'; f.marker[1] = 'b'; f.marker[2] = 'l';
     f.sender_id   = origin_id;
     f.origin_id   = origin_id;
-    f.msg_type    = WSAN_MSG_DATA;
-    f.msg_id      = wsan_make_msgid(&seq16);
+    f.msg_type    = BGKP_MSG_DATA;
+    f.msg_id      = bgkp_make_msgid(&seq16);
     f.target_id   = rsu_id;
     f.payload     = (const uint8_t *)&pl;
     f.payload_len = (uint16_t)sizeof(pl);
     f.ts_ms       = last_ts_ms;
 
-    uint8_t buf[WSAN_MAX_FRAME];
+    uint8_t buf[BGKP_MAX_FRAME];
     uint16_t out_len = 0;
-    if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
+    if(!bgkp_pack(&f, buf, sizeof(buf), &out_len)) return;
 
-    if(!wsan_carry_exists(&carry, f.origin_id, f.msg_id))
-        carry_store(WSAN_MSG_DATA,
+    if(!bgkp_carry_exists(&carry, f.origin_id, f.msg_id))
+        carry_store(BGKP_MSG_DATA,
                     f.origin_id, f.msg_id, f.ts_ms,
                     pl.x_dm, pl.y_dm, pl.v_dmps, pl.dir8, pl.rssi_dbm, pl.ttl8, 0);
 
-#if WSAN_METRIC_LOG_ENABLED
+#if BGKP_METRIC_LOG_ENABLED
     printf("MBL_TX type=DATA mode=RSU origin=%lu msg=%lu "
            "x=%ld y=%ld v=%u dir=%u ts=%lu\n",
            (unsigned long)origin_id, (unsigned long)f.msg_id,
@@ -1289,7 +1305,7 @@ send_data_unicast_to_rsu(void)
 #endif
 
     start_unicast_with_retries(&udp, &rsu_ip, buf, out_len,
-                               WSAN_UNICAST_RETRIES);
+                               BGKP_UNICAST_RETRIES);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1305,37 +1321,42 @@ send_data_unicast_to_rsu(void)
 static void
 start_gossip_data(void)
 {
-    dctx.msg_id      = wsan_make_msgid(&seq16);
+    dctx.msg_id      = bgkp_make_msgid(&seq16);
     dctx.ts_ms       = last_ts_ms;
     dctx.x_dm        = (int16_t)loc_x_dm;
     dctx.y_dm        = (int16_t)loc_y_dm;
     dctx.v_dmps      = v_dmps;
     dctx.dir8        = dir8;
     dctx.rssi_dbm    = 0;
-    dctx.ttl8        = WSAN_DATA_TTL_DEFAULT;
+    dctx.ttl8        = BGKP_DATA_TTL_DEFAULT;
     dctx.ack_mask    = 0;
     dctx.retry_count = 1;   /* first send counts as attempt #1 */
     dctx.active      = 1;
 
     cand_seen  = 0;
-    cand_id[0] = WSAN_FRIEND_EMPTY;
-    cand_id[1] = WSAN_FRIEND_EMPTY;
+    cand_id[0] = BGKP_FRIEND_EMPTY;
+    cand_id[1] = BGKP_FRIEND_EMPTY;
 
-    uint8_t buf[WSAN_MAX_FRAME];
+    uint8_t buf[BGKP_MAX_FRAME];
     uint16_t out_len = build_gossip_frame(buf, sizeof(buf));
     if(out_len == 0) { dctx.active = 0; return; }
 
 #if FRIEND_LIST_MONITOR_ENABLED
-    printf("MBL: Sending Data/Gossip created by %lu, ID= %lu\n",(unsigned long)origin_id,(unsigned long)dctx.msg_id);
+    printf("MBL: Sending Data/Gossip created by %lu, ID= %lu. Friends: %lu and %lu\n",
+           (unsigned long)origin_id,
+           (unsigned long)dctx.msg_id,
+           (unsigned long)friend_id[0]+1,
+           (unsigned long)friend_id[1]+1
+           );
 #endif //FRIEND_LIST_MONITOR_ENABLED
 
-    if(!wsan_carry_exists(&carry, origin_id, dctx.msg_id))
-        carry_store(WSAN_MSG_DATA,
+    if(!bgkp_carry_exists(&carry, origin_id, dctx.msg_id))
+        carry_store(BGKP_MSG_DATA,
                     origin_id, dctx.msg_id, dctx.ts_ms,
                     dctx.x_dm, dctx.y_dm, dctx.v_dmps,
                     dctx.dir8, dctx.rssi_dbm, dctx.ttl8, 0);
 
-#if WSAN_METRIC_LOG_ENABLED
+#if BGKP_METRIC_LOG_ENABLED
     printf("MBL_TX type=DATA mode=GOSSIP origin=%lu msg=%lu "
            "x=%ld y=%ld v=%u dir=%u ts=%lu\n",
            (unsigned long)origin_id, (unsigned long)dctx.msg_id,
@@ -1345,9 +1366,9 @@ start_gossip_data(void)
 #endif
 
     start_broadcast_fanout(&data_fanout_ctx, &udp, buf, out_len,
-                           WSAN_FANOUT_DATA);
+                           BGKP_FANOUT_DATA);
     ctimer_set(&t_data_ack_window,
-               ms_to_ticks_ceil(WSAN_JITTER_MS),
+               ms_to_ticks_ceil(BGKP_JITTER_MS),
                data_ack_window_cb, NULL);
 
 
@@ -1371,22 +1392,22 @@ udp_rx_cb(struct simple_udp_connection *c,
 {
     (void)c; (void)sender_port; (void)receiver_addr; (void)receiver_port;
 
-    wsan_fields_t h;
+    bgkp_fields_t h;
     const uint8_t *pl = NULL;
     uint16_t pl_len   = 0;
-    if(!wsan_parse(data, datalen, &h, &pl, &pl_len)) return;
+    if(!bgkp_parse(data, datalen, &h, &pl, &pl_len)) return;
 
     /* Dedup: DATA duplicates are still ACKed but not stored twice. */
-    uint8_t is_dup = wsan_dedup_has(&dedup, h.origin_id, h.msg_id);
+    uint8_t is_dup = bgkp_dedup_has(&dedup, h.origin_id, h.msg_id);
     if(is_dup) {
-        if(h.msg_type != WSAN_MSG_DATA) return;
+        if(h.msg_type != BGKP_MSG_DATA) return;
     } else {
-        wsan_dedup_put(&dedup, h.origin_id, h.msg_id);
+        bgkp_dedup_put(&dedup, h.origin_id, h.msg_id);
     }
 
     /* ---- RSU ACK ------------------------------------------------- */
     if(h.marker[0]=='R' && h.marker[1]=='S' && h.marker[2]=='U') {
-        if(h.msg_type != WSAN_MSG_ACK) return;
+        if(h.msg_type != BGKP_MSG_ACK) return;
 
         rsu_ip         = *sender_addr;
         rsu_id         = h.origin_id;
@@ -1396,20 +1417,20 @@ udp_rx_cb(struct simple_udp_connection *c,
         /* Learn emergency state propagated by RSU in ACK payload. */
         if(pl && pl_len >= 14) {
             uint8_t  ef_code   = pl[9];
-            uint32_t ef_origin = wsan_u32_be_read(&pl[10]);
+            uint32_t ef_origin = bgkp_u32_be_read(&pl[10]);
             if(ef_origin != 0) {
-                if(ef_code == WSAN_EF_FINISH)      ef_remove(ef_origin);
-                else if(ef_code != WSAN_EF_NONE)   ef_add_or_update(ef_origin, ef_code);
+                if(ef_code == BGKP_EF_FINISH)      ef_remove(ef_origin);
+                else if(ef_code != BGKP_EF_NONE)   ef_add_or_update(ef_origin, ef_code);
                 ef_led_refresh();
             }
         }
 
         /* Mark ACKed carry slot as free. */
         if(pl && pl_len >= 9) {
-            uint32_t acked_origin = wsan_u32_be_read(&pl[1]);
-            uint32_t acked_msg    = wsan_u32_be_read(&pl[5]);
-            wsan_carry_ack(&carry, acked_origin, acked_msg);
-#if WSAN_METRIC_LOG_ENABLED
+            uint32_t acked_origin = bgkp_u32_be_read(&pl[1]);
+            uint32_t acked_msg    = bgkp_u32_be_read(&pl[5]);
+            bgkp_carry_ack(&carry, acked_origin, acked_msg);
+#if BGKP_METRIC_LOG_ENABLED
             printf("MBL_ACK acked_type=%u origin=%lu msg=%lu\n",
                    (unsigned)pl[0],
                    (unsigned long)acked_origin,
@@ -1424,14 +1445,14 @@ udp_rx_cb(struct simple_udp_connection *c,
 
     /* ---- Mobile ACK ---------------------------------------------- */
     if(h.marker[0]=='M' && h.marker[1]=='b' && h.marker[2]=='l') {
-        if(h.msg_type == WSAN_MSG_ACK) {
+        if(h.msg_type == BGKP_MSG_ACK) {
             if(pl && pl_len >= 9) {
                 uint8_t  acked_type   = pl[0];
-                uint32_t acked_origin = wsan_u32_be_read(&pl[1]);
-                uint32_t acked_msg    = wsan_u32_be_read(&pl[5]);
+                uint32_t acked_origin = bgkp_u32_be_read(&pl[1]);
+                uint32_t acked_msg    = bgkp_u32_be_read(&pl[5]);
                 uint32_t a_sender     = h.sender_id;
 
-                if(acked_type   == WSAN_MSG_DATA &&
+                if(acked_type   == BGKP_MSG_DATA &&
                    acked_origin == origin_id     &&
                    acked_msg    == dctx.msg_id   &&
                    dctx.active) {
@@ -1441,9 +1462,9 @@ udp_rx_cb(struct simple_udp_connection *c,
 #endif
 
                     /* Update ACK mask for existing friends. */
-                    if(friend_id[0] != WSAN_FRIEND_EMPTY &&
+                    if(friend_id[0] != BGKP_FRIEND_EMPTY &&
                        a_sender == friend_id[0]) dctx.ack_mask |= 0x01u;
-                    if(friend_id[1] != WSAN_FRIEND_EMPTY &&
+                    if(friend_id[1] != BGKP_FRIEND_EMPTY &&
                        a_sender == friend_id[1]) dctx.ack_mask |= 0x02u;
 
                     /*
@@ -1484,16 +1505,16 @@ udp_rx_cb(struct simple_udp_connection *c,
     if(h.marker[0]!='M' || h.marker[1]!='b' || h.marker[2]!='l') return;
 
     /* ---- QUERY from another mobile ------------------------------- */
-    if(h.msg_type == WSAN_MSG_QUERY) {
+    if(h.msg_type == BGKP_MSG_QUERY) {
         if(pl && pl_len >= 5) {
             uint8_t  ef_flag = pl[0];
-            uint32_t ef_orig = wsan_u32_be_read(&pl[1]);
-            if(ef_flag == WSAN_EF_NONE) return;
+            uint32_t ef_orig = bgkp_u32_be_read(&pl[1]);
+            if(ef_flag == BGKP_EF_NONE) return;
             if(ef_find(ef_orig) < 0)    return;  /* accept only known origins */
-            if(ef_flag == WSAN_EF_FINISH) ef_remove(ef_orig);
+            if(ef_flag == BGKP_EF_FINISH) ef_remove(ef_orig);
             else                          ef_add_or_update(ef_orig, ef_flag);
             ef_led_refresh();
-#if WSAN_DIAG
+#if BGKP_DIAG
             printf("%lu,QUERY_RX,from=%lu,ef=%u,ef_orig=%lu\n",
                    (unsigned long)clock_seconds(),
                    (unsigned long)h.origin_id,
@@ -1504,26 +1525,26 @@ udp_rx_cb(struct simple_udp_connection *c,
     }
 
     /* ---- DATA from another mobile -------------------------------- */
-    if(h.msg_type == WSAN_MSG_DATA) {
+    if(h.msg_type == BGKP_MSG_DATA) {
         uint32_t fl[2];
         friend_list_read(pl, pl_len, fl);
 
         uint8_t ttl = 0;
-        if(pl_len >= sizeof(wsan_data_payload_t))
-            ttl = ((const wsan_data_payload_t *)pl)->ttl8;
+        if(pl_len >= sizeof(bgkp_data_payload_t))
+            ttl = ((const bgkp_data_payload_t *)pl)->ttl8;
 
         /* Ignore if sender or their friend list overlaps ours. */
-/*
+
         if(is_my_friend(h.sender_id)) {
 #if FRIEND_LIST_MONITOR_ENABLED
             printf("MBL: Not sending an ACK to MsgID#%lu sent by mote %lu, "
-                   "because sender is already my friend\n",
+                   "because sender is my friend and is ACKing me.\n",
                    (unsigned long)h.msg_id,
                    (unsigned long)h.sender_id);
 #endif
             return;
         }
-*/
+
 /*
         if(friend_list_contains_my_friend(fl)) {
 #if FRIEND_LIST_MONITOR_ENABLED
@@ -1537,10 +1558,10 @@ udp_rx_cb(struct simple_udp_connection *c,
 */
 
         uint8_t addressed_to_me =
-            ((fl[0] != WSAN_FRIEND_EMPTY && fl[0] == origin_id) ||
-             (fl[1] != WSAN_FRIEND_EMPTY && fl[1] == origin_id));
+            ((fl[0] != BGKP_FRIEND_EMPTY && fl[0] == origin_id) ||
+             (fl[1] != BGKP_FRIEND_EMPTY && fl[1] == origin_id));
         uint8_t sender_list_full =
-            (fl[0] != WSAN_FRIEND_EMPTY && fl[1] != WSAN_FRIEND_EMPTY);
+            (fl[0] != BGKP_FRIEND_EMPTY && fl[1] != BGKP_FRIEND_EMPTY);
 
         if(addressed_to_me) {
             /* We are a listed friend: ACK immediately (even on duplicate). */
@@ -1549,10 +1570,10 @@ udp_rx_cb(struct simple_udp_connection *c,
 
             /* Store on first reception only.
              * Metrics come from the received payload (creator's values). */
-            if(!is_dup && !wsan_carry_exists(&carry, h.origin_id, h.msg_id)) {
-                const wsan_data_payload_t *dp =
-                    (const wsan_data_payload_t *)pl;
-                carry_store(WSAN_MSG_DATA,
+            if(!is_dup && !bgkp_carry_exists(&carry, h.origin_id, h.msg_id)) {
+                const bgkp_data_payload_t *dp =
+                    (const bgkp_data_payload_t *)pl;
+                carry_store(BGKP_MSG_DATA,
                             h.origin_id, h.msg_id, h.ts_ms,
                             dp->x_dm, dp->y_dm, dp->v_dmps,
                             dp->dir8, dp->rssi_dbm, dp->ttl8, 0);
@@ -1562,17 +1583,17 @@ udp_rx_cb(struct simple_udp_connection *c,
             /* Forward with TTL-1 on first reception only.
              * Only sender_id and ttl8 change; all other fields preserved. */
             if(!is_dup && ttl > 0) {
-                wsan_fields_t fwd        = h;
-                wsan_data_payload_t pcopy;
+                bgkp_fields_t fwd        = h;
+                bgkp_data_payload_t pcopy;
                 memcpy(&pcopy, pl, sizeof(pcopy));
                 pcopy.ttl8       = (uint8_t)(ttl - 1);
                 fwd.sender_id    = origin_id;  /* we are the physical forwarder */
                 fwd.payload      = (const uint8_t *)&pcopy;
                 fwd.payload_len  = (uint16_t)sizeof(pcopy);
 
-                uint8_t buf2[WSAN_MAX_FRAME];
+                uint8_t buf2[BGKP_MAX_FRAME];
                 uint16_t out2 = 0;
-                if(wsan_pack(&fwd, buf2, sizeof(buf2), &out2))
+                if(bgkp_pack(&fwd, buf2, sizeof(buf2), &out2))
                     start_broadcast_fanout(&data_fanout_ctx, &udp, buf2, out2, 1);
             }
             return;
@@ -1584,17 +1605,15 @@ udp_rx_cb(struct simple_udp_connection *c,
         if(!sender_list_full && candidate_ok(pl, pl_len)) {
             schedule_ack(sender_addr, h.sender_id, h.ts_ms,
                          h.msg_type, h.origin_id, h.msg_id, 1);
-#if FRIEND_LIST_MONITOR_ENABLED
-            printf("MBL: ACKing MsgID=%lu from mote#%lu. ",(unsigned long)h.msg_id, (unsigned long)h.sender_id);
-#endif
+
         } else {
-#if WSAN_DIAG
+#if BGKP_DIAG
             if(sender_list_full) {
                 printf("MBL: Rejecting ACK for MsgID#%lu, from mote %lu, "
                        "because sender friend-list is full\n",
                        (unsigned long)h.msg_id,
                        (unsigned long)h.sender_id);
-            } else if(pl == NULL || pl_len < sizeof(wsan_data_payload_t)) {
+            } else if(pl == NULL || pl_len < sizeof(bgkp_data_payload_t)) {
                 printf("MBL: Not sending an ACK to MsgID#%lu sent by mote %lu, "
                        "because payload is too short (%u bytes)\n",
                        (unsigned long)h.msg_id,
@@ -1612,7 +1631,7 @@ udp_rx_cb(struct simple_udp_connection *c,
     }
 
     /* ---- EMERGENCY from another mobile --------------------------- */
-    if(h.msg_type == WSAN_MSG_EMERGENCY) {
+    if(h.msg_type == BGKP_MSG_EMERGENCY) {
         send_ack_unicast(sender_addr, h.origin_id, h.ts_ms,
                          h.msg_type, h.origin_id, h.msg_id);
 
@@ -1622,22 +1641,22 @@ udp_rx_cb(struct simple_udp_connection *c,
             uint8_t src_dir = dir8;
             if(pl_len >= 12) src_dir = pl[5 + 6];
 
-            if(efc != WSAN_EF_FINISH &&
-               dir8 != WSAN_DIR_UNK  &&
+            if(efc != BGKP_EF_FINISH &&
+               dir8 != BGKP_DIR_UNK  &&
                src_dir != dir8) return;
 
-            ef_led_set(efc != WSAN_EF_FINISH);
-            if(efc == WSAN_EF_FINISH) ef_remove(h.origin_id);
+            ef_led_set(efc != BGKP_EF_FINISH);
+            if(efc == BGKP_EF_FINISH) ef_remove(h.origin_id);
             else                      ef_add_or_update(h.origin_id, efc);
             ef_led_refresh();
         }
 
-        if(!is_dup && !wsan_carry_exists(&carry, h.origin_id, h.msg_id)) {
+        if(!is_dup && !bgkp_carry_exists(&carry, h.origin_id, h.msg_id)) {
             /* Extract metrics from EF payload for compact carry record. */
             uint8_t ef_code = 0;
             int16_t  ex = 0, ey = 0;
             uint16_t ev = 0;
-            uint8_t  edir = WSAN_DIR_UNK;
+            uint8_t  edir = BGKP_DIR_UNK;
             if(pl && pl_len >= 12 &&
                pl[0]=='E' && pl[1]=='F' && pl[2]=='B' && pl[3]=='R') {
                 ef_code = pl[4];
@@ -1646,13 +1665,13 @@ udp_rx_cb(struct simple_udp_connection *c,
                 ev   = (uint16_t)((uint16_t)pl[9] | ((uint16_t)pl[10] << 8));
                 edir = pl[11];
             }
-            carry_store(WSAN_MSG_EMERGENCY,
+            carry_store(BGKP_MSG_EMERGENCY,
                         h.origin_id, h.msg_id, h.ts_ms,
                         ex, ey, ev, edir, 0, 0, ef_code);
         }
 
         start_broadcast_fanout(&ef_fanout_ctx, &udp, data, datalen,
-                               WSAN_FANOUT_EF);
+                               BGKP_FANOUT_EF);
         if(have_rsu && carry_has_pending()) start_carry_flush();
         return;
     }
@@ -1661,15 +1680,15 @@ udp_rx_cb(struct simple_udp_connection *c,
 /* ------------------------------------------------------------------ */
 /*  Process thread                                                    */
 /* ------------------------------------------------------------------ */
-PROCESS(mobile_process, "WSAN Mobile");
+PROCESS(mobile_process, "BGKP Mobile");
 AUTOSTART_PROCESSES(&mobile_process);
 
 PROCESS_THREAD(mobile_process, ev, data)
 {
     PROCESS_BEGIN();
 
-    simple_udp_register(&udp, WSAN_UDP_PORT, NULL,
-                        WSAN_UDP_PORT, udp_rx_cb);
+    simple_udp_register(&udp, BGKP_UDP_PORT, NULL,
+                        BGKP_UDP_PORT, udp_rx_cb);
     serial_line_init();
     uart1_set_input(serial_line_input_byte);
 
@@ -1677,21 +1696,21 @@ PROCESS_THREAD(mobile_process, ev, data)
     origin_id = (uint32_t)node_id8;
     random_init(origin_id);
 
-    wsan_dedup_init(&dedup);
-    wsan_carry_init(&carry);
+    bgkp_dedup_init(&dedup);
+    bgkp_carry_init(&carry);
 
-#if WSAN_DIAG
+#if BGKP_DIAG
     printf("STAT carry_slot_bytes=%u carry_items=%u carry_total_bytes=%lu\n",
-           (unsigned)sizeof(wsan_carry_slot_t),
-           (unsigned)WSAN_CARRY_MAX_ITEMS,
-           (unsigned long)(sizeof(wsan_carry_slot_t) *
-                           (unsigned long)WSAN_CARRY_MAX_ITEMS));
+           (unsigned)sizeof(bgkp_carry_slot_t),
+           (unsigned)BGKP_CARRY_MAX_ITEMS,
+           (unsigned long)(sizeof(bgkp_carry_slot_t) *
+                           (unsigned long)BGKP_CARRY_MAX_ITEMS));
 #endif
 
-    etimer_set(&t_query,    WSAN_T_QUERY_MS    * CLOCK_SECOND / 1000);
-    etimer_set(&t_gossip,   WSAN_T_GOSSIP_MS   * CLOCK_SECOND / 1000);
-    etimer_set(&t_rsu_data, WSAN_T_DATA_MS     * CLOCK_SECOND / 1000);
-    etimer_set(&t_loc,      WSAN_T_LOCATION_MS * CLOCK_SECOND / 1000);
+    etimer_set(&t_query,    BGKP_T_QUERY_MS    * CLOCK_SECOND / 1000);
+    etimer_set(&t_gossip,   BGKP_T_GOSSIP_MS   * CLOCK_SECOND / 1000);
+    etimer_set(&t_rsu_data, BGKP_T_DATA_MS     * CLOCK_SECOND / 1000);
+    etimer_set(&t_loc,      BGKP_T_LOCATION_MS * CLOCK_SECOND / 1000);
 
     while(1) {
         PROCESS_YIELD();
@@ -1712,7 +1731,7 @@ PROCESS_THREAD(mobile_process, ev, data)
                 if(delta >= 3) {
                     have_rsu = 0;
                     ctimer_stop(&uctx.timer); uctx.remaining = 0;
-#if WSAN_DIAG
+#if BGKP_DIAG
                     printf("%lu,STAT,HAVE_RSU=0\n",
                            (unsigned long)clock_seconds());
 #endif

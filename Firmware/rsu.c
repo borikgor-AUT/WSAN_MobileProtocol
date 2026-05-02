@@ -1,5 +1,5 @@
 /*
- * WSAN RSU mote (Contiki-NG, Sky/MSPSim)
+ * BGKP RSU mote (Contiki-NG, Sky/MSPSim)
  *
  * Responsibilities:
  *  - Receive QUERY/DATA/EMERGENCY from Mobile ("Mbl").
@@ -25,30 +25,30 @@
 #include <string.h>
 #include <stdint.h>
 
-#include "wsan_common.h"
-#include "wsan_protocol.h"
+#include "bgkp_common.h"
+#include "bgkp_protocol.h"
 
 /* ---------- Metric logging control ---------- */
-#ifndef WSAN_METRIC_LOG_ENABLED
-#define WSAN_METRIC_LOG_ENABLED 0
+#ifndef BGKP_METRIC_LOG_ENABLED
+#define BGKP_METRIC_LOG_ENABLED 0
 #endif
 
 /* ---------- Diagnostic prints control ---------- */
-#ifndef WSAN_DIAG
-#define WSAN_DIAG 0
+#ifndef BGKP_DIAG
+#define BGKP_DIAG 0
 #endif
 
 
 static struct simple_udp_connection udp;
 static uint32_t origin_id;                 /* RSU OriginID */
 static uint16_t seq16 = 0;                 /* RSU MsgID sequence */
-static wsan_dedup_t dedup;                 /* Dedup ring */
+static bgkp_dedup_t dedup;                 /* Dedup ring */
 
-#if WSAN_METRIC_LOG_ENABLED
+#if BGKP_METRIC_LOG_ENABLED
 /* ------------------------------------------------------------------
  * Helper: rsu_log_rx()
  * What:
- *   Print one line for each WSAN frame received from a Mobile, using
+ *   Print one line for each BGKP frame received from a Mobile, using
  *   the same key=value format as the Mobile uses for its TX logs,
  *   but with an RSU_RX header.
  * Methods:
@@ -57,7 +57,7 @@ static wsan_dedup_t dedup;                 /* Dedup ring */
  *   Local decoded metrics (x,y,v,dir) and optional EF code.
  */
 static void
-rsu_log_rx(const wsan_fields_t *h,
+rsu_log_rx(const bgkp_fields_t *h,
                   const uint8_t *pl,
                   uint16_t pl_len)
 {
@@ -66,11 +66,11 @@ rsu_log_rx(const wsan_fields_t *h,
     }
 
     /* DATA payload: x(2) y(2) v(2) dir(1) ... total 17 bytes */
-    if(h->msg_type == WSAN_MSG_DATA) {
+    if(h->msg_type == BGKP_MSG_DATA) {
         int16_t x = 0;
         int16_t y = 0;
         uint16_t v = 0;
-        uint8_t dir = WSAN_DIR_UNK;
+        uint8_t dir = BGKP_DIR_UNK;
 
         if(pl != NULL && pl_len >= 7) {
             x = (int16_t)((uint16_t)pl[0] | ((uint16_t)pl[1] << 8));
@@ -92,12 +92,12 @@ rsu_log_rx(const wsan_fields_t *h,
     }
 
     /* EMERGENCY payload: "EFBR" + code + metrics (12 bytes total) */
-    if(h->msg_type == WSAN_MSG_EMERGENCY) {
+    if(h->msg_type == BGKP_MSG_EMERGENCY) {
         uint8_t code = 0;
         int16_t x = 0;
         int16_t y = 0;
         uint16_t v = 0;
-        uint8_t dir = WSAN_DIR_UNK;
+        uint8_t dir = BGKP_DIR_UNK;
 
         if(pl != NULL && pl_len >= 5) {
             if(pl[0] == 'E' && pl[1] == 'F' && pl[2] == 'B' &&
@@ -129,7 +129,7 @@ rsu_log_rx(const wsan_fields_t *h,
     }
 
     /* QUERY: Mobile does not print it in TX logs, but we still report. */
-    if(h->msg_type == WSAN_MSG_QUERY) {
+    if(h->msg_type == BGKP_MSG_QUERY) {
         /*printf("RSU_RX type=QUERY origin=%lu msg=%lu ts=%lu\n",
                (unsigned long)h->origin_id,
                (unsigned long)h->msg_id,
@@ -177,7 +177,7 @@ ef_find(uint32_t origin)
 static void
 ef_add_or_update(uint32_t origin, uint8_t code)
 {
-    if(code == WSAN_EF_NONE || code == WSAN_EF_FINISH) return;
+    if(code == BGKP_EF_NONE || code == BGKP_EF_FINISH) return;
 
     int8_t idx = ef_find(origin);
     if(idx >= 0) {
@@ -230,7 +230,7 @@ ef_pick_for_ack(uint32_t *out_origin, uint8_t *out_code)
  * Methods: simple_udp_sendto() + ctimer.
  */
 typedef struct {
-    uint8_t  buf[WSAN_MAX_FRAME];
+    uint8_t  buf[BGKP_MAX_FRAME];
     uint16_t len;
     uint8_t  remaining;
     struct simple_udp_connection *udp;
@@ -251,7 +251,7 @@ rsu_fanout_cb(void *ptr)
     ctx->remaining--;
 
     if(ctx->remaining) {
-        uint16_t d = wsan_rand_jitter_ms();
+        uint16_t d = bgkp_rand_jitter_ms();
         ctimer_set(&ctx->timer,
                    (clock_time_t)(d * CLOCK_SECOND / 1000),
                    rsu_fanout_cb, ctx);
@@ -282,7 +282,7 @@ rsu_start_fanout(rsu_fanout_ctx_t *ctx,
 
     ctx->remaining = (uint8_t)(fanout - 1);
 
-    uint16_t d = wsan_rand_jitter_ms();
+    uint16_t d = bgkp_rand_jitter_ms();
     ctimer_set(&ctx->timer,
                (clock_time_t)(d * CLOCK_SECOND / 1000),
                rsu_fanout_cb, ctx);
@@ -291,7 +291,7 @@ rsu_start_fanout(rsu_fanout_ctx_t *ctx,
 /* ------------------------------------------------------------------
  * Helper: send_ack_to()
  * What:
- *  - Build WSAN/ACK from RSU and send unicast back.
+ *  - Build BGKP/ACK from RSU and send unicast back.
  *  - Payload layout (backward compatible extension):
  *    [0]     acked_type
  *    [1..4]  acked_origin (BE)
@@ -309,20 +309,20 @@ send_ack_to(const uip_ipaddr_t *dst,
 {
     if(dst == NULL) return;
 
-    wsan_fields_t f;
+    bgkp_fields_t f;
     memset(&f, 0, sizeof(f));
 
     f.marker[0] = 'R'; f.marker[1] = 'S'; f.marker[2] = 'U';
     f.sender_id = origin_id;
     f.origin_id = origin_id;
-    f.msg_type  = WSAN_MSG_ACK;
-    f.msg_id    = wsan_make_msgid(&seq16);
+    f.msg_type  = BGKP_MSG_ACK;
+    f.msg_id    = bgkp_make_msgid(&seq16);
     f.target_id = target_id;
 
     uint8_t pl[14];
     pl[0] = acked_type;
-    wsan_u32_be_write(&pl[1], acked_origin);
-    wsan_u32_be_write(&pl[5], acked_msg);
+    bgkp_u32_be_write(&pl[1], acked_origin);
+    bgkp_u32_be_write(&pl[5], acked_msg);
 
     uint32_t ef_origin = 0;
     uint8_t ef_code = 0;
@@ -331,22 +331,22 @@ send_ack_to(const uip_ipaddr_t *dst,
         ef_code = 0;
     }
     pl[9] = ef_code;
-    wsan_u32_be_write(&pl[10], ef_origin);
+    bgkp_u32_be_write(&pl[10], ef_origin);
 
     f.payload = pl;
     f.payload_len = sizeof(pl);
     f.ts_ms = ts_ms;
 
-    uint8_t buf[WSAN_MAX_FRAME];
+    uint8_t buf[BGKP_MAX_FRAME];
     uint16_t out_len = 0;
-    if(!wsan_pack(&f, buf, sizeof(buf), &out_len)) return;
+    if(!bgkp_pack(&f, buf, sizeof(buf), &out_len)) return;
 
     simple_udp_sendto(&udp, buf, out_len, dst);
 }
 
 /* ------------------------------------------------------------------
  * UDP RX callback
- * What: Parse WSAN frames, dedup, ACK, log, update EF registry,
+ * What: Parse BGKP frames, dedup, ACK, log, update EF registry,
  *       and re-broadcast emergencies.
  */
 static void
@@ -362,12 +362,12 @@ udp_rx_cb(struct simple_udp_connection *c,
     (void)receiver_addr;
     (void)receiver_port;
 
-    wsan_fields_t h;
+    bgkp_fields_t h;
     const uint8_t *pl = NULL;
     uint16_t pl_len = 0;
 
-    /* Drop anything that is not a valid WSAN frame. */
-    if(!wsan_parse(data, datalen, &h, &pl, &pl_len)) {
+    /* Drop anything that is not a valid BGKP frame. */
+    if(!bgkp_parse(data, datalen, &h, &pl, &pl_len)) {
         return;
     }
 
@@ -377,31 +377,31 @@ udp_rx_cb(struct simple_udp_connection *c,
     }
 
     /* ACK QUERY/DATA/EMERGENCY (unicast back to the sender). */
-    if(h.msg_type == WSAN_MSG_QUERY ||
-       h.msg_type == WSAN_MSG_DATA ||
-       h.msg_type == WSAN_MSG_EMERGENCY) {
+    if(h.msg_type == BGKP_MSG_QUERY ||
+       h.msg_type == BGKP_MSG_DATA ||
+       h.msg_type == BGKP_MSG_EMERGENCY) {
         send_ack_to(sender_addr, h.origin_id, h.ts_ms,
                     h.msg_type, h.origin_id, h.msg_id);
     }
 
     /* Dedup (OriginID, MsgID) - process each unique frame once. */
-    if(wsan_dedup_has(&dedup, h.origin_id, h.msg_id)) {
+    if(bgkp_dedup_has(&dedup, h.origin_id, h.msg_id)) {
         return;
     }
-    wsan_dedup_put(&dedup, h.origin_id, h.msg_id);
+    bgkp_dedup_put(&dedup, h.origin_id, h.msg_id);
 
     /* Optional metric logging in Mobile-like format. */
-#if WSAN_METRIC_LOG_ENABLED
+#if BGKP_METRIC_LOG_ENABLED
     rsu_log_rx(&h, pl, pl_len);
 #endif
 
     /* DATA needs no extra RSU-side logic beyond ACK + optional log. */
-    if(h.msg_type == WSAN_MSG_DATA) {
+    if(h.msg_type == BGKP_MSG_DATA) {
         return;
     }
 
     /* EMERGENCY decoding + registry update + re-broadcast. */
-    if(h.msg_type == WSAN_MSG_EMERGENCY) {
+    if(h.msg_type == BGKP_MSG_EMERGENCY) {
         int32_t code = -1;
 
         if(pl != NULL && pl_len >= 5) {
@@ -410,14 +410,14 @@ udp_rx_cb(struct simple_udp_connection *c,
                 code = (int32_t)pl[4];
 
                 /* Update registry. */
-                if(code == WSAN_EF_FINISH) {
+                if(code == BGKP_EF_FINISH) {
                     ef_remove(h.origin_id);
-                } else if(code != WSAN_EF_NONE) {
+                } else if(code != BGKP_EF_NONE) {
                     ef_add_or_update(h.origin_id, (uint8_t)code);
                 }
 
                 /* Update last-received placeholder for ACK propagation. */
-                if(code == WSAN_EF_FINISH || code == WSAN_EF_NONE) {
+                if(code == BGKP_EF_FINISH || code == BGKP_EF_NONE) {
                     last_rx_ef_code = 0;
                     last_rx_ef_origin = 0;
                 } else {
@@ -434,15 +434,15 @@ udp_rx_cb(struct simple_udp_connection *c,
 }
 
 
-PROCESS(rsu_process, "WSAN RSU");
+PROCESS(rsu_process, "BGKP RSU");
 AUTOSTART_PROCESSES(&rsu_process);
 
 PROCESS_THREAD(rsu_process, ev, data)
 {
     PROCESS_BEGIN();
 
-    simple_udp_register(&udp, WSAN_UDP_PORT, NULL,
-                        WSAN_UDP_PORT, udp_rx_cb);
+    simple_udp_register(&udp, BGKP_UDP_PORT, NULL,
+                        BGKP_UDP_PORT, udp_rx_cb);
 
     /* Serial line on UART1 (Cooja Serial port) */
     serial_line_init();
@@ -451,13 +451,13 @@ PROCESS_THREAD(rsu_process, ev, data)
     origin_id = (uint32_t)linkaddr_node_addr.u8[7];
     random_init(origin_id);
 
-    wsan_dedup_init(&dedup);
+    bgkp_dedup_init(&dedup);
 
     while(1) {
         PROCESS_YIELD();
 
         if(ev == serial_line_event_message && data) {
-#if WSAN_DIAG
+#if BGKP_DIAG
             printf("RSU_UART: %s\n", (const char *)data);
 #endif
         }

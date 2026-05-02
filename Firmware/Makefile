@@ -8,4 +8,4 @@ MAKE_ROUTING = MAKE_ROUTING_NULLROUTING
 
 CONTIKI = ../..
 include $(CONTIKI)/Makefile.include
-CFLAGS += -DWSAN_MAX_CLIENTS=90 -DPROJECT_CONF_H=\"project-conf.h\"
+CFLAGS += -DBGKP_MAX_CLIENTS=90 -DPROJECT_CONF_H=\"project-conf.h\"

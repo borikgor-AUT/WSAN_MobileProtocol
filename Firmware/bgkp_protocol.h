@@ -1,16 +1,16 @@
-#ifndef WSAN_PROTOCOL_H_
-#define WSAN_PROTOCOL_H_
+#ifndef BGKP_PROTOCOL_H_
+#define BGKP_PROTOCOL_H_
 
 /*
- * WSAN protocol (v1.4-compatible) + compact inline utilities.
- * This header intentionally *replaces* the old wsan_helpers.h to
- * avoid duplication and ODR issues. Do not include wsan_helpers.h.
+ * BGKP protocol (v1.4-compatible) + compact inline utilities.
+ * This header intentionally *replaces* the old bgkp_helpers.h to
+ * avoid duplication and ODR issues. Do not include bgkp_helpers.h.
  * [802.15.4 MAC hdr]
  * [6LoWPAN hdr: Dispatch/IPHC/... (variable)]
  * [IPv6 hdr (compressed by IPHC, variable)]
  * [UDP hdr (compressed by NHC, variable, includes UDP checksum 2B)]
- * [UDP payload = WSAN frame]
- *     ["WSAN"(4)]
+ * [UDP payload = BGKP frame]
+ *     ["BGKP"(4)]
  *     [MsgLen(3)]
  *     [Marker(3) = "Mbl" or "RSU"]
  *     [SenderID(4) BE]
@@ -18,9 +18,9 @@
  *     [MsgID(4) BE]
  *     [TargetID(4) BE]
  *     [OriginID(4) BE]
- *     [WSAN payload (variable)]
+ *     [BGKP payload (variable)]
  *     [TimeStamp(4) BE]
- *     [WSAN Chk8(1)]
+ *     [BGKP Chk8(1)]
  * [802.15.4 FCS footer]
  **************************************
  * QUERY payload (MsgType = 0)  5 byte:
@@ -46,18 +46,18 @@
 #include "sys/clock.h"
 #include "net/ipv6/simple-udp.h"
 
-#include "wsan_common.h"
+#include "bgkp_common.h"
 
 /* ------------------------------------------------------------------ */
 /*  Checksum (Chk8)                                                    */
 /* ------------------------------------------------------------------ */
 /*
- * wsan_chk8()
+ * bgkp_chk8()
  * What:     Compute LSB of sum of bytes in buffer.
  * Methods:  Linear pass, uint16 accumulator, LSB at the end.
  * Creates:  local uint16_t 's' accumulator.
  */
-static inline uint8_t wsan_chk8(const uint8_t *buf, size_t len)
+static inline uint8_t bgkp_chk8(const uint8_t *buf, size_t len)
 {
     uint16_t s = 0;
     for(size_t i = 0; i < len; ++i) s += buf[i];
@@ -68,12 +68,12 @@ static inline uint8_t wsan_chk8(const uint8_t *buf, size_t len)
 /*  BE read/write (u32)                                                */
 /* ------------------------------------------------------------------ */
 /*
- * wsan_u32_be_write()
+ * bgkp_u32_be_write()
  * What:     Store 32-bit value in Big-Endian order into p[0..3].
  * Methods:  Shift-and-mask.
  * Creates:  none.
  */
-static inline void wsan_u32_be_write(uint8_t *p, uint32_t v)
+static inline void bgkp_u32_be_write(uint8_t *p, uint32_t v)
 {
     p[0] = (uint8_t)((v >> 24) & 0xFF);
     p[1] = (uint8_t)((v >> 16) & 0xFF);
@@ -82,12 +82,12 @@ static inline void wsan_u32_be_write(uint8_t *p, uint32_t v)
 }
 
 /*
- * wsan_u32_be_read()
+ * bgkp_u32_be_read()
  * What:     Read Big-Endian 32-bit value from p[0..3].
  * Methods:  Shift-and-or.
  * Creates:  none.
  */
-static inline uint32_t wsan_u32_be_read(const uint8_t *p)
+static inline uint32_t bgkp_u32_be_read(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8)  | ((uint32_t)p[3]);
@@ -96,20 +96,22 @@ static inline uint32_t wsan_u32_be_read(const uint8_t *p)
 
 
 /* ------------------------------------------------------------------ */
-/*  Random jitter (0..WSAN_JITTER_MS)                                  */
+/*  Random jitter (0..BGKP_JITTER_MS)                                  */
 /* ------------------------------------------------------------------ */
 /*
- * wsan_rand_jitter_ms()
- * What:     Produce 0..WSAN_JITTER_MS pseudo-random jitter in ms.
+ * bgkp_rand_jitter_ms()
+ * What:     Produce 0..BGKP_JITTER_MS pseudo-random jitter in ms.
  * Methods:  Scale 16-bit random_rand() to [0..JITTER].
  * Creates:  none.
  */
-static inline uint16_t wsan_rand_jitter_ms(void)
+static inline uint16_t bgkp_rand_jitter_ms(void)
 {
     unsigned int d_ms = 0;
     d_ms = (uint16_t)(((uint32_t)(random_rand() & 0xFFFFu) *
-                       (uint32_t)WSAN_JITTER_MS) / 65535u);
+                       (uint32_t)BGKP_JITTER_MS) / 65535u);
+#if FRIEND_LIST_MONITOR_ENABLED
     printf("MBL: Delaying %lu milliseconds.\n",(unsigned long)d_ms);
+#endif //FRIEND_LIST_MONITOR_ENABLED
     return d_ms;
 }
 
@@ -117,75 +119,75 @@ static inline uint16_t wsan_rand_jitter_ms(void)
 /*  Direction quantization (octants)                                   */
 /* ------------------------------------------------------------------ */
 /*
- * wsan_dir_from_delta()
+ * bgkp_dir_from_delta()
  * What:     Map dx,dy (dm or any linear unit) to octant 0..7 or UNK.
  * Methods:  No floats/atan2; compare |dx| and |dy| with factor 2.
  * Creates:  local adx, ady, qx, qy.
  */
-static inline uint8_t wsan_dir_from_delta(int32_t dx, int32_t dy)
+static inline uint8_t bgkp_dir_from_delta(int32_t dx, int32_t dy)
 {
     /*
-     * wsan_dir_from_delta()
-     * What:    Map dx,dy to octant 0..7; return WSAN_DIR_UNK when stationary.
+     * bgkp_dir_from_delta()
+     * What:    Map dx,dy to octant 0..7; return BGKP_DIR_UNK when stationary.
      * Methods: No floats/atan2; compare |dx| and |dy| using factor 2.
      * Creates: adx, ady.
      */
     int32_t adx = (dx < 0) ? -dx : dx;
     int32_t ady = (dy < 0) ? -dy : dy;
 
-    if (adx == 0 && ady == 0) return WSAN_DIR_UNK;
+    if (adx == 0 && ady == 0) return BGKP_DIR_UNK;
 
-    if (adx >= (ady << 1)) return (dx >= 0) ? WSAN_DIR_E : WSAN_DIR_W;
-    if (ady >= (adx << 1)) return (dy >= 0) ? WSAN_DIR_N : WSAN_DIR_S;
+    if (adx >= (ady << 1)) return (dx >= 0) ? BGKP_DIR_E : BGKP_DIR_W;
+    if (ady >= (adx << 1)) return (dy >= 0) ? BGKP_DIR_N : BGKP_DIR_S;
 
-    if (dx >= 0 && dy >= 0) return WSAN_DIR_NE;
-    if (dx <  0 && dy >= 0) return WSAN_DIR_NW;
-    if (dx <  0 && dy <  0) return WSAN_DIR_SW;
-    return WSAN_DIR_SE;
+    if (dx >= 0 && dy >= 0) return BGKP_DIR_NE;
+    if (dx <  0 && dy >= 0) return BGKP_DIR_NW;
+    if (dx <  0 && dy <  0) return BGKP_DIR_SW;
+    return BGKP_DIR_SE;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Dedup (very small fixed-size ring)                                 */
 /* ------------------------------------------------------------------ */
-#ifndef WSAN_DEDUP_MAX
-#define WSAN_DEDUP_MAX 64
+#ifndef BGKP_DEDUP_MAX
+#define BGKP_DEDUP_MAX 64
 #endif
 
 typedef struct {
     uint32_t origin_id;
     uint32_t msg_id;
-} wsan_key_t;
+} bgkp_key_t;
 
 typedef struct {
-    wsan_key_t items[WSAN_DEDUP_MAX];
+    bgkp_key_t items[BGKP_DEDUP_MAX];
     uint8_t    used;
     uint8_t    head; /* ring index for overwrite */
-} wsan_dedup_t;
+} bgkp_dedup_t;
 
 /*
- * wsan_dedup_init()
+ * bgkp_dedup_init()
  * What:     Reset dedup ring.
  * Methods:  memset.
  * Creates:  none.
  */
-static inline void wsan_dedup_init(wsan_dedup_t *d)
+static inline void bgkp_dedup_init(bgkp_dedup_t *d)
 {
     memset(d, 0, sizeof(*d));
 }
 
 /*
- * wsan_dedup_has()
+ * bgkp_dedup_has()
  * What:     Check if (origin,msg) exists in ring.
  * Methods:  linear scan up to 'used'.
  * Creates:  loop index idx.
  */
-static inline uint8_t wsan_dedup_has(wsan_dedup_t *d,
+static inline uint8_t bgkp_dedup_has(bgkp_dedup_t *d,
                                      uint32_t origin,
                                      uint32_t msg)
 {
     for(uint8_t i = 0; i < d->used; ++i) {
-        uint8_t idx = (uint8_t)((i < WSAN_DEDUP_MAX) ? i
-                                                    : (i % WSAN_DEDUP_MAX));
+        uint8_t idx = (uint8_t)((i < BGKP_DEDUP_MAX) ? i
+                                                    : (i % BGKP_DEDUP_MAX));
         if(d->items[idx].origin_id == origin &&
            d->items[idx].msg_id    == msg) return 1;
     }
@@ -193,19 +195,19 @@ static inline uint8_t wsan_dedup_has(wsan_dedup_t *d,
 }
 
 /*
- * wsan_dedup_put()
+ * bgkp_dedup_put()
  * What:     Insert (origin,msg) at head, overwrite when full.
  * Methods:  ring buffer with head++ mod size.
  * Creates:  none.
  */
-static inline void wsan_dedup_put(wsan_dedup_t *d,
+static inline void bgkp_dedup_put(bgkp_dedup_t *d,
                                   uint32_t origin,
                                   uint32_t msg)
 {
     d->items[d->head].origin_id = origin;
     d->items[d->head].msg_id    = msg;
-    d->head = (uint8_t)((d->head + 1) % WSAN_DEDUP_MAX);
-    if(d->used < WSAN_DEDUP_MAX) d->used++;
+    d->head = (uint8_t)((d->head + 1) % BGKP_DEDUP_MAX);
+    if(d->used < BGKP_DEDUP_MAX) d->used++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -213,27 +215,27 @@ static inline void wsan_dedup_put(wsan_dedup_t *d,
 /*                                                                    */
 /*  Instead of storing a full serialized wire frame (49 bytes for     */
 /*  DATA, 44 for EF), we store only the fields needed by the RSU.     */
-/*  The WSAN frame is rebuilt from this record at flush time.         */
+/*  The BGKP frame is rebuilt from this record at flush time.         */
 /*                                                                    */
 /*  Record layout (21 bytes):                                         */
-/*    msg_type  (1)  — WSAN_MSG_DATA or WSAN_MSG_EMERGENCY            */
+/*    msg_type  (1)  — BGKP_MSG_DATA or BGKP_MSG_EMERGENCY            */
 /*    origin_id (4)  — creator of the message                         */
 /*    msg_id    (4)  — message identifier                             */
 /*    ts_ms     (4)  — creation timestamp (frozen)                    */
 /*    x_dm      (2)  — position X, dm, little-endian                  */
 /*    y_dm      (2)  — position Y, dm, little-endian                  */
 /*    v_dmps    (2)  — speed, dm/s, little-endian                     */
-/*    dir8      (1)  — direction octant 0..7 or WSAN_DIR_UNK          */
+/*    dir8      (1)  — direction octant 0..7 or BGKP_DIR_UNK          */
 /*    rssi_dbm  (1)  — RSSI (0 in Cooja)                              */
 /*    ttl8      (1)  — DATA hop budget                                */
 /*    ef_code   (1)  — EF code for EMERGENCY; 0 for DATA              */
 /*                                                                    */
 /*  Total: 21 bytes per slot × 16 slots = 336 bytes                   */
 /*  (vs 49 × 16 = 784 bytes for full-frame storage, which also        */
-/*   caused memory corruption when WSAN_CARRY_MAX_FRAME was 16)       */
+/*   caused memory corruption when BGKP_CARRY_MAX_FRAME was 16)       */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    uint8_t  msg_type;      /* WSAN_MSG_DATA or WSAN_MSG_EMERGENCY */
+    uint8_t  msg_type;      /* BGKP_MSG_DATA or BGKP_MSG_EMERGENCY */
     uint32_t origin_id;
     uint32_t msg_id;
     uint32_t ts_ms;
@@ -245,43 +247,43 @@ typedef struct {
     uint8_t  ttl8;          /* DATA hop budget */
     uint8_t  ef_code;       /* 0 for DATA records */
     uint8_t  in_use;        /* 1 if slot is occupied; 0 = free/acked */
-} __attribute__((packed)) wsan_carry_slot_t;
+} __attribute__((packed)) bgkp_carry_slot_t;
 
 /* Compile-time sanity check (requires C11).
 #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
-_Static_assert(sizeof(wsan_carry_slot_t) == 23,
-               "wsan_carry_slot_t size changed: check packing/layout");
+_Static_assert(sizeof(bgkp_carry_slot_t) == 23,
+               "bgkp_carry_slot_t size changed: check packing/layout");
 #endif
 */
 
 typedef struct {
-    wsan_carry_slot_t slots[WSAN_CARRY_MAX_ITEMS];
+    bgkp_carry_slot_t slots[BGKP_CARRY_MAX_ITEMS];
     uint16_t          count;
     uint16_t          head;  /* next write index (ring) */
-} wsan_carry_t;
+} bgkp_carry_t;
 
 /*
- * wsan_carry_init()
+ * bgkp_carry_init()
  * What:     Reset carry store.
  * Methods:  memset.
  * Creates:  none.
  */
-static inline void wsan_carry_init(wsan_carry_t *c)
+static inline void bgkp_carry_init(bgkp_carry_t *c)
 {
     memset(c, 0, sizeof(*c));
 }
 
 /*
- * wsan_carry_exists()
+ * bgkp_carry_exists()
  * What:     Check if (origin, msg) is already in the store.
  * Methods:  Linear scan over in_use slots.
  * Creates:  loop index i.
  */
-static inline uint8_t wsan_carry_exists(wsan_carry_t *c,
+static inline uint8_t bgkp_carry_exists(bgkp_carry_t *c,
                                         uint32_t origin,
                                         uint32_t msg)
 {
-    for(uint16_t i = 0; i < WSAN_CARRY_MAX_ITEMS; ++i) {
+    for(uint16_t i = 0; i < BGKP_CARRY_MAX_ITEMS; ++i) {
         if(c->slots[i].in_use &&
            c->slots[i].origin_id == origin &&
            c->slots[i].msg_id    == msg) return 1;
@@ -290,13 +292,13 @@ static inline uint8_t wsan_carry_exists(wsan_carry_t *c,
 }
 
 /*
- * wsan_carry_put()
+ * bgkp_carry_put()
  * What:     Insert a compact record into the ring store.
  *           Overwrites the oldest slot when full (ring semantics).
- * Methods:  Write fields at head; advance head mod WSAN_CARRY_MAX_ITEMS.
+ * Methods:  Write fields at head; advance head mod BGKP_CARRY_MAX_ITEMS.
  * Creates:  none.
  */
-static inline void wsan_carry_put(wsan_carry_t *c,
+static inline void bgkp_carry_put(bgkp_carry_t *c,
                                   uint8_t  msg_type,
                                   uint32_t origin,
                                   uint32_t msg,
@@ -312,7 +314,7 @@ static inline void wsan_carry_put(wsan_carry_t *c,
     uint16_t idx = 0xFFFFu;
 
     /* Find a free slot first (in_use == 0). */
-    for(uint16_t i = 0; i < WSAN_CARRY_MAX_ITEMS; ++i) {
+    for(uint16_t i = 0; i < BGKP_CARRY_MAX_ITEMS; ++i) {
         if(!c->slots[i].in_use) { idx = i; break; }
     }
 
@@ -339,23 +341,23 @@ static inline void wsan_carry_put(wsan_carry_t *c,
     c->slots[idx].ef_code   = ef_code;
 
     /* Move head to the next slot after the one we just used. */
-    c->head = (uint16_t)((idx + 1u) % WSAN_CARRY_MAX_ITEMS);
+    c->head = (uint16_t)((idx + 1u) % BGKP_CARRY_MAX_ITEMS);
 
     /* Count increases only when we consumed a previously free slot. */
-    if(was_free && c->count < WSAN_CARRY_MAX_ITEMS) c->count++;
+    if(was_free && c->count < BGKP_CARRY_MAX_ITEMS) c->count++;
 }
 
 /*
- * wsan_carry_ack()
+ * bgkp_carry_ack()
  * What:     Mark a slot as free when the RSU ACKs it.
  * Methods:  Linear scan; clear in_use on match.
  * Creates:  loop index i.
  */
-static inline void wsan_carry_ack(wsan_carry_t *c,
+static inline void bgkp_carry_ack(bgkp_carry_t *c,
                                   uint32_t origin,
                                   uint32_t msg)
 {
-    for(uint16_t i = 0; i < WSAN_CARRY_MAX_ITEMS; ++i) {
+    for(uint16_t i = 0; i < BGKP_CARRY_MAX_ITEMS; ++i) {
         if(c->slots[i].in_use &&
            c->slots[i].origin_id == origin &&
            c->slots[i].msg_id    == msg) {
@@ -370,12 +372,12 @@ static inline void wsan_carry_ack(wsan_carry_t *c,
 /*  MsgID helper                                                       */
 /* ------------------------------------------------------------------ */
 /*
- * wsan_make_msgid()
+ * bgkp_make_msgid()
  * What:     Build MsgID = [HH][MM][SEQ16] (BE on the wire in pack()).
  * Methods:  Use clock_seconds(); reset seq if minute changed.
  * Creates:  static g_min_snapshot; local hh, mm, seq.
  */
-static inline uint32_t wsan_make_msgid(uint16_t *p_seq16)
+static inline uint32_t bgkp_make_msgid(uint16_t *p_seq16)
 {
     static uint8_t g_min_snapshot = 0;
     uint32_t secs = clock_seconds();
@@ -394,11 +396,11 @@ static inline uint32_t wsan_make_msgid(uint16_t *p_seq16)
 
 
 /* ------------------------------------------------------------------ */
-/*  WSAN wire format (pack/parse)                                      */
+/*  BGKP wire format (pack/parse)                                      */
 /* ------------------------------------------------------------------ */
 /*
- * WSAN frame (v1.5) on the wire (BE multi-byte header fields):
- *   [ "WSAN"(4) ]
+ * BGKP frame (v1.5) on the wire (BE multi-byte header fields):
+ *   [ "BGKP"(4) ]
  *   [ MsgLen(3) ]        // [00][hi][lo], bytes from Marker .. CS inclusive
  *   [ Marker(3) ]        // "Mbl" or "RSU"
  *   [ SenderID(4) ]      // BE, changes every hop (physical sender)
@@ -421,10 +423,10 @@ typedef struct {
     uint16_t payload_len;
     const uint8_t *payload;
     uint32_t ts_ms;
-} wsan_fields_t;
+} bgkp_fields_t;
 
 /* =========================================================================
- * Unified WSAN payload descriptions
+ * Unified BGKP payload descriptions
  * ========================================================================= */
 
 /* DATA payload: metrics + friend list (always present) */
@@ -437,29 +439,29 @@ typedef struct {
     uint8_t friend1_be[4];   /* friend slot #1, BE on wire */
     uint8_t friend2_be[4];   /* friend slot #2, BE on wire */
     uint8_t ttl8;            /* NEW: hop budget for DATA gossip */
-} __attribute__((packed)) wsan_data_payload_t;
+} __attribute__((packed)) bgkp_data_payload_t;
 
 /* EMERGENCY payload: EF code + same metrics */
 typedef struct __attribute__((packed)) {
     char    sig[4];     /* "EFBR" */
-    uint8_t ef_code;    /* WSAN_EF_* */
+    uint8_t ef_code;    /* BGKP_EF_* */
     int16_t x_dm;
     int16_t y_dm;
     uint16_t v_dmps;
     uint8_t dir8;
-} wsan_emergency_payload_t;
+} bgkp_emergency_payload_t;
 
 /*
- * wsan_pack()
+ * bgkp_pack()
  * What:     Serialize fields into 'out'; return total len in out_len.
  * Methods:  Fill header, write BE fields, compute body len and CS.
  */
 static inline uint8_t
-wsan_pack(const wsan_fields_t *f, uint8_t *out, uint16_t cap, uint16_t *out_len)
+bgkp_pack(const bgkp_fields_t *f, uint8_t *out, uint16_t cap, uint16_t *out_len)
 {
     if(!f || !out || !out_len || cap < 32) return 0;
 
-    /* "WSAN" */
+    /* "BGKP" */
     out[0] = 'W'; out[1] = 'S'; out[2] = 'A'; out[3] = 'N';
 
     /* MsgLen placeholder */
@@ -471,28 +473,28 @@ wsan_pack(const wsan_fields_t *f, uint8_t *out, uint16_t cap, uint16_t *out_len)
     out[9] = (uint8_t)f->marker[2];
 
     /* SenderID BE */
-    wsan_u32_be_write(&out[10], f->sender_id);
+    bgkp_u32_be_write(&out[10], f->sender_id);
 
     /* MsgType */
     out[14] = f->msg_type;
 
     /* MsgID BE */
-    wsan_u32_be_write(&out[15], f->msg_id);
+    bgkp_u32_be_write(&out[15], f->msg_id);
 
     /* TargetID BE */
-    wsan_u32_be_write(&out[19], f->target_id);
+    bgkp_u32_be_write(&out[19], f->target_id);
 
     /* OriginID BE */
-    wsan_u32_be_write(&out[23], f->origin_id);
+    bgkp_u32_be_write(&out[23], f->origin_id);
 
     /* Payload */
-    if(f->payload_len > (WSAN_MAX_FRAME - 32)) return 0;
+    if(f->payload_len > (BGKP_MAX_FRAME - 32)) return 0;
     if(f->payload_len && f->payload) {
         memcpy(&out[27], f->payload, f->payload_len);
     }
 
     /* TimeStamp BE */
-    wsan_u32_be_write(&out[27 + f->payload_len], f->ts_ms);
+    bgkp_u32_be_write(&out[27 + f->payload_len], f->ts_ms);
 
     /* Body length (Marker..CS inclusive) */
     uint16_t body_len = (uint16_t)(25 + f->payload_len);
@@ -503,7 +505,7 @@ wsan_pack(const wsan_fields_t *f, uint8_t *out, uint16_t cap, uint16_t *out_len)
 
     /* CS over all bytes before CS */
     uint16_t pre_cs_len = (uint16_t)(4 + 3 + body_len - 1);
-    uint8_t cs = wsan_chk8(out, pre_cs_len);
+    uint8_t cs = bgkp_chk8(out, pre_cs_len);
     out[27 + f->payload_len + 4] = cs;
 
     *out_len = (uint16_t)(pre_cs_len + 1);
@@ -511,13 +513,13 @@ wsan_pack(const wsan_fields_t *f, uint8_t *out, uint16_t cap, uint16_t *out_len)
 }
 
 /*
- * wsan_parse()
- * What:     Validate and parse WSAN frame from 'in'.
+ * bgkp_parse()
+ * What:     Validate and parse BGKP frame from 'in'.
  * Methods:  Check signature/length/CS; expose payload view.
  */
 static inline uint8_t
-wsan_parse(const uint8_t *in, uint16_t in_len,
-           wsan_fields_t *f, const uint8_t **pl, uint16_t *pl_len)
+bgkp_parse(const uint8_t *in, uint16_t in_len,
+           bgkp_fields_t *f, const uint8_t **pl, uint16_t *pl_len)
 {
     if(!in || !f || !pl || !pl_len || in_len < 32) return 0;
     if(in[0] != 'W' || in[1] != 'S' || in[2] != 'A' || in[3] != 'N') return 0;
@@ -526,7 +528,7 @@ wsan_parse(const uint8_t *in, uint16_t in_len,
     uint16_t expect = (uint16_t)(4 + 3 + body_len);
     if(in_len != expect) return 0;
 
-    uint8_t cs_calc = wsan_chk8(in, (uint16_t)(expect - 1));
+    uint8_t cs_calc = bgkp_chk8(in, (uint16_t)(expect - 1));
     uint8_t cs_got = in[expect - 1];
     if(cs_calc != cs_got) return 0;
 
@@ -534,11 +536,11 @@ wsan_parse(const uint8_t *in, uint16_t in_len,
     f->marker[1] = (char)in[8];
     f->marker[2] = (char)in[9];
 
-    f->sender_id = wsan_u32_be_read(&in[10]);
+    f->sender_id = bgkp_u32_be_read(&in[10]);
     f->msg_type  = in[14];
-    f->msg_id    = wsan_u32_be_read(&in[15]);
-    f->target_id = wsan_u32_be_read(&in[19]);
-    f->origin_id = wsan_u32_be_read(&in[23]);
+    f->msg_id    = bgkp_u32_be_read(&in[15]);
+    f->target_id = bgkp_u32_be_read(&in[19]);
+    f->origin_id = bgkp_u32_be_read(&in[23]);
 
     uint16_t pay_len = (uint16_t)(body_len - 25);
     *pl = &in[27];
@@ -546,9 +548,9 @@ wsan_parse(const uint8_t *in, uint16_t in_len,
 
     f->payload = *pl;
     f->payload_len = *pl_len;
-    f->ts_ms = wsan_u32_be_read(&in[27 + pay_len]);
+    f->ts_ms = bgkp_u32_be_read(&in[27 + pay_len]);
 
     return 1;
 }
 
-#endif /* WSAN_PROTOCOL_H_ */
+#endif /* BGKP_PROTOCOL_H_ */
