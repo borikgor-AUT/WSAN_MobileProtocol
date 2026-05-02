@@ -211,24 +211,24 @@ static inline void bgkp_dedup_put(bgkp_dedup_t *d,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Carry store (Mobile) — compact record format                      */
+/*  Carry store (Mobile) - compact record format                      */
 /*                                                                    */
 /*  Instead of storing a full serialized wire frame (49 bytes for     */
 /*  DATA, 44 for EF), we store only the fields needed by the RSU.     */
 /*  The BGKP frame is rebuilt from this record at flush time.         */
 /*                                                                    */
 /*  Record layout (21 bytes):                                         */
-/*    msg_type  (1)  — BGKP_MSG_DATA or BGKP_MSG_EMERGENCY            */
-/*    origin_id (4)  — creator of the message                         */
-/*    msg_id    (4)  — message identifier                             */
-/*    ts_ms     (4)  — creation timestamp (frozen)                    */
-/*    x_dm      (2)  — position X, dm, little-endian                  */
-/*    y_dm      (2)  — position Y, dm, little-endian                  */
-/*    v_dmps    (2)  — speed, dm/s, little-endian                     */
-/*    dir8      (1)  — direction octant 0..7 or BGKP_DIR_UNK          */
-/*    rssi_dbm  (1)  — RSSI (0 in Cooja)                              */
-/*    ttl8      (1)  — DATA hop budget                                */
-/*    ef_code   (1)  — EF code for EMERGENCY; 0 for DATA              */
+/*    msg_type  (1)  - BGKP_MSG_DATA or BGKP_MSG_EMERGENCY            */
+/*    origin_id (4)  - creator of the message                         */
+/*    msg_id    (4)  - message identifier                             */
+/*    ts_ms     (4)  - creation timestamp (frozen)                    */
+/*    x_dm      (2)  - position X, dm, little-endian                  */
+/*    y_dm      (2)  - position Y, dm, little-endian                  */
+/*    v_dmps    (2)  - speed, dm/s, little-endian                     */
+/*    dir8      (1)  - direction octant 0..7 or BGKP_DIR_UNK          */
+/*    rssi_dbm  (1)  - RSSI (0 in Cooja)                              */
+/*    ttl8      (1)  - DATA hop budget                                */
+/*    ef_code   (1)  - EF code for EMERGENCY; 0 for DATA              */
 /*                                                                    */
 /*  Total: 21 bytes per slot × 16 slots = 336 bytes                   */
 /*  (vs 49 × 16 = 784 bytes for full-frame storage, which also        */
@@ -369,7 +369,7 @@ static inline void bgkp_carry_ack(bgkp_carry_t *c,
 }
 
 /* ------------------------------------------------------------------ */
-/*  MsgID helper                                                       */
+/*  MsgID helper                                                      */
 /* ------------------------------------------------------------------ */
 /*
  * bgkp_make_msgid()
@@ -396,7 +396,7 @@ static inline uint32_t bgkp_make_msgid(uint16_t *p_seq16)
 
 
 /* ------------------------------------------------------------------ */
-/*  BGKP wire format (pack/parse)                                      */
+/*  BGKP wire format (pack/parse)                                     */
 /* ------------------------------------------------------------------ */
 /*
  * BGKP frame (v1.5) on the wire (BE multi-byte header fields):
@@ -410,7 +410,7 @@ static inline uint32_t bgkp_make_msgid(uint16_t *p_seq16)
  *   [ OriginID(4) ]      // BE (creator, stable)
  *   [ Payload(..) ]
  *   [ TimeStamp(4) ]     // BE (ms from simulator/script)
- *   [ CS(1) ]            // LSB of sum from 'W' to end of TimeStamp
+ *   [ CS(1) ]            // LSB of sum from 'B' to end of TimeStamp
  */
 
 typedef struct {
@@ -425,9 +425,9 @@ typedef struct {
     uint32_t ts_ms;
 } bgkp_fields_t;
 
-/* =========================================================================
- * Unified BGKP payload descriptions
- * ========================================================================= */
+/* ------------------------------------------------------------------ */
+/* Unified BGKP payload descriptions                                  */
+/* ------------------------------------------------------------------ */
 
 /* DATA payload: metrics + friend list (always present) */
 typedef struct {
@@ -451,18 +451,19 @@ typedef struct __attribute__((packed)) {
     uint8_t dir8;
 } bgkp_emergency_payload_t;
 
-/*
- * bgkp_pack()
- * What:     Serialize fields into 'out'; return total len in out_len.
- * Methods:  Fill header, write BE fields, compute body len and CS.
- */
+/* ------------------------------------------------------------------ */
+/* bgkp_pack()                                                        */
+/* What:     Serialize fields into 'out'; return total len in out_len.*/
+/* Methods:  Fill header, write BE fields, compute body len and CS.   */
+/* ------------------------------------------------------------------ */
+
 static inline uint8_t
 bgkp_pack(const bgkp_fields_t *f, uint8_t *out, uint16_t cap, uint16_t *out_len)
 {
     if(!f || !out || !out_len || cap < 32) return 0;
 
     /* "BGKP" */
-    out[0] = 'W'; out[1] = 'S'; out[2] = 'A'; out[3] = 'N';
+    out[0] = 'B'; out[1] = 'G'; out[2] = 'K'; out[3] = 'P';
 
     /* MsgLen placeholder */
     out[4] = 0x00; out[5] = 0x00; out[6] = 0x00;
@@ -522,7 +523,7 @@ bgkp_parse(const uint8_t *in, uint16_t in_len,
            bgkp_fields_t *f, const uint8_t **pl, uint16_t *pl_len)
 {
     if(!in || !f || !pl || !pl_len || in_len < 32) return 0;
-    if(in[0] != 'W' || in[1] != 'S' || in[2] != 'A' || in[3] != 'N') return 0;
+    if(in[0] != 'B' || in[1] != 'G' || in[2] != 'K' || in[3] != 'P') return 0;
 
     uint16_t body_len = (uint16_t)(((uint16_t)in[5] << 8) | in[6]);
     uint16_t expect = (uint16_t)(4 + 3 + body_len);
