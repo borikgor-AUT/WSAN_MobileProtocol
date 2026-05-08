@@ -53,7 +53,7 @@
  * fan-out cycle per (OriginID,MsgID).
  */
 #define BGKP_T_GOSSIP_MS 2500 /* DATA broadcast period w/o RSU */
-#define BGKP_FANOUT_DATA 1    /* #rebroadcasts per node for DATA */
+#define BGKP_FANOUT_DATA 3    /* #rebroadcasts per node for DATA */
 #define BGKP_FANOUT_EF   3    /* #rebroadcasts per node for EF/Finish */
 #define BGKP_JITTER_MS   100  /* Maximum time to wait for a new friend's ACK due to Jitter */
 #define BGKP_DEDUP_MAX   64   /* Maximum message unique numbers to be deduplicated */
@@ -72,13 +72,13 @@
 #define BGKP_FRIEND_EMPTY 0xFFFFFFFFu
 
 /* ===== Friend selection thresholds ===== */
-#define BGKP_FRIEND_DIST_DM 500 /* 50 m (500 dm) */
-#define BGKP_FRIEND_DV_DMPS 50  /* 5 m/s (50 dm/s) */
+// #define BGKP_FRIEND_DIST_DM 500 /* 50 m (500 dm) */
+#define BGKP_FRIEND_DV_DMPS 150  /* 5 m/s (50 dm/s) */
 #define BGKP_FRIEND_DIR_TOL 1   /* +/- 1 octant */
 
 /* ===== Carry store sizing ===== */
 #ifndef BGKP_CARRY_MAX_ITEMS
-#define BGKP_CARRY_MAX_ITEMS 64 /* mobile's carry store count-limited */
+#define BGKP_CARRY_MAX_ITEMS 16 /* mobile's carry store count-limited */
 #endif
 
 /* ===== Direction (octants) for EF payload

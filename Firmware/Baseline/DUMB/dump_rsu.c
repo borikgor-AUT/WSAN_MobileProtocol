@@ -1,5 +1,5 @@
 /*
- * BGKP RSU mote (Contiki-NG, Sky/MSPSim)
+ * DUMB RSU mote (Contiki-NG, Sky/MSPSim)
  *
  * Responsibilities:
  *  - Receive QUERY/DATA/EMERGENCY from Mobile ("Mbl").
@@ -25,24 +25,24 @@
 #include <string.h>
 #include <stdint.h>
 
-#include "bgkp_common.h"
-#include "bgkp_protocol.h"
+#include "dumb_common.h"
+#include "dumb_protocol.h"
 
 /* ---------- Metric logging control ---------- */
-#ifndef BGKP_METRIC_LOG_ENABLED
-#define BGKP_METRIC_LOG_ENABLED 1
+#ifndef DUMB_METRIC_LOG_ENABLED
+#define DUMB_METRIC_LOG_ENABLED 1
 #endif
 
 /* ---------- Diagnostic prints control ---------- */
-#ifndef BGKP_DIAG
-#define BGKP_DIAG 0
+#ifndef DUMB_DIAG
+#define DUMB_DIAG 0
 #endif
 
 
 static struct simple_udp_connection udp;
 static uint32_t origin_id;                 /* RSU OriginID */
 static uint16_t seq16 = 0;                 /* RSU MsgID sequence */
-static bgkp_dedup_t dedup;                 /* Dedup ring */
+static dumb_dedup_t dedup;                 /* Dedup ring */
 
 /* ------------------------------------------------------------------
  * Emergency registry (RSU)
@@ -82,7 +82,7 @@ ef_find(uint32_t origin)
 static void
 ef_add_or_update(uint32_t origin, uint8_t code)
 {
-    if(code == BGKP_EF_NONE || code == BGKP_EF_FINISH) return;
+    if(code == DUMB_EF_NONE || code == DUMB_EF_FINISH) return;
 
     int8_t idx = ef_find(origin);
     if(idx >= 0) {
@@ -135,7 +135,7 @@ ef_pick_for_ack(uint32_t *out_origin, uint8_t *out_code)
  * Methods: simple_udp_sendto() + ctimer.
  */
 typedef struct {
-    uint8_t  buf[BGKP_MAX_FRAME];
+    uint8_t  buf[DUMB_MAX_FRAME];
     uint16_t len;
     uint8_t  remaining;
     struct simple_udp_connection *udp;
@@ -156,7 +156,7 @@ rsu_fanout_cb(void *ptr)
     ctx->remaining--;
 
     if(ctx->remaining) {
-        uint16_t d = bgkp_rand_jitter_ms();
+        uint16_t d = dumb_rand_jitter_ms();
         ctimer_set(&ctx->timer,
                    (clock_time_t)(d * CLOCK_SECOND / 1000),
                    rsu_fanout_cb, ctx);
@@ -187,7 +187,7 @@ rsu_start_fanout(rsu_fanout_ctx_t *ctx,
 
     ctx->remaining = (uint8_t)(fanout - 1);
 
-    uint16_t d = bgkp_rand_jitter_ms();
+    uint16_t d = dumb_rand_jitter_ms();
     ctimer_set(&ctx->timer,
                (clock_time_t)(d * CLOCK_SECOND / 1000),
                rsu_fanout_cb, ctx);
@@ -196,7 +196,7 @@ rsu_start_fanout(rsu_fanout_ctx_t *ctx,
 /* ------------------------------------------------------------------
  * Helper: send_ack_to()
  * What:
- *  - Build BGKP/ACK from RSU and send unicast back.
+ *  - Build DUMB/ACK from RSU and send unicast back.
  *  - Payload layout (backward compatible extension):
  *    [0]     acked_type
  *    [1..4]  acked_origin (BE)
@@ -214,20 +214,20 @@ send_ack_to(const uip_ipaddr_t *dst,
 {
     if(dst == NULL) return;
 
-    bgkp_fields_t f;
+    dumb_fields_t f;
     memset(&f, 0, sizeof(f));
 
     f.marker[0] = 'R'; f.marker[1] = 'S'; f.marker[2] = 'U';
     f.sender_id = origin_id;
     f.origin_id = origin_id;
-    f.msg_type  = BGKP_MSG_ACK;
-    f.msg_id    = bgkp_make_msgid(&seq16);
+    f.msg_type  = DUMB_MSG_ACK;
+    f.msg_id    = dumb_make_msgid(&seq16);
     f.target_id = target_id;
 
     uint8_t pl[14];
     pl[0] = acked_type;
-    bgkp_u32_be_write(&pl[1], acked_origin);
-    bgkp_u32_be_write(&pl[5], acked_msg);
+    dumb_u32_be_write(&pl[1], acked_origin);
+    dumb_u32_be_write(&pl[5], acked_msg);
 
     uint32_t ef_origin = 0;
     uint8_t ef_code = 0;
@@ -236,22 +236,22 @@ send_ack_to(const uip_ipaddr_t *dst,
         ef_code = 0;
     }
     pl[9] = ef_code;
-    bgkp_u32_be_write(&pl[10], ef_origin);
+    dumb_u32_be_write(&pl[10], ef_origin);
 
     f.payload = pl;
     f.payload_len = sizeof(pl);
     f.ts_ms = ts_ms;
 
-    uint8_t buf[BGKP_MAX_FRAME];
+    uint8_t buf[DUMB_MAX_FRAME];
     uint16_t out_len = 0;
-    if(!bgkp_pack(&f, buf, sizeof(buf), &out_len)) return;
+    if(!dumb_pack(&f, buf, sizeof(buf), &out_len)) return;
 
     simple_udp_sendto(&udp, buf, out_len, dst);
 }
 
 /* ------------------------------------------------------------------
  * UDP RX callback
- * What: Parse BGKP frames, dedup, ACK, log, update EF registry,
+ * What: Parse DUMB frames, dedup, ACK, log, update EF registry,
  *       and re-broadcast emergencies.
  */
 static void
@@ -267,12 +267,12 @@ udp_rx_cb(struct simple_udp_connection *c,
     (void)receiver_addr;
     (void)receiver_port;
 
-    bgkp_fields_t h;
+    dumb_fields_t h;
     const uint8_t *pl = NULL;
     uint16_t pl_len = 0;
 
-    /* Drop anything that is not a valid BGKP frame. */
-    if(!bgkp_parse(data, datalen, &h, &pl, &pl_len)) {
+    /* Drop anything that is not a valid DUMB frame. */
+    if(!dumb_parse(data, datalen, &h, &pl, &pl_len)) {
         return;
     }
 
@@ -282,40 +282,43 @@ udp_rx_cb(struct simple_udp_connection *c,
     }
 
     /* ACK QUERY/DATA/EMERGENCY (unicast back to the sender). */
-    if(h.msg_type == BGKP_MSG_QUERY ||
-       h.msg_type == BGKP_MSG_DATA ||
-       h.msg_type == BGKP_MSG_EMERGENCY) {
+    if(h.msg_type == DUMB_MSG_QUERY ||
+       h.msg_type == DUMB_MSG_DATA ||
+       h.msg_type == DUMB_MSG_EMERGENCY) {
         send_ack_to(sender_addr, h.origin_id, h.ts_ms,
                     h.msg_type, h.origin_id, h.msg_id);
     }
 
     /* Dedup (OriginID, MsgID) - process each unique frame once. */
-    if(bgkp_dedup_has(&dedup, h.origin_id, h.msg_id)) {
+    if(dumb_dedup_has(&dedup, h.origin_id, h.msg_id)) {
         return;
     }
-    bgkp_dedup_put(&dedup, h.origin_id, h.msg_id);
+    dumb_dedup_put(&dedup, h.origin_id, h.msg_id);
 
     /* Optional metric logging in Mobile-like format. */
-#if BGKP_METRIC_LOG_ENABLED
-    const bgkp_data_payload_t *dpl =
-        (const bgkp_data_payload_t *)pl;
+#if DUMB_METRIC_LOG_ENABLED
+    if((h.msg_type == DUMB_MSG_DATA) || (h.msg_type == DUMB_MSG_EMERGENCY)) {
+        const dumb_data_payload_t *dpl =
+            (const dumb_data_payload_t *)pl;
+        uint32_t rx_time = (clock_time()*1000)/CLOCK_SECOND;
 
 	printf("RSU RX origin=%lu msg=%lu hop=%u len=%u time=%lu\n",
 	       (unsigned long)h.origin_id,
 	       (unsigned long)h.msg_id,
-	       (unsigned)(BGKP_DATA_TTL_DEFAULT - dpl->ttl8 + 1),
+	       (unsigned)(DUMB_DATA_TTL_DEFAULT - dpl->ttl8 + 1),
 	       (unsigned)pl_len,
-	       (unsigned long)h.ts_ms);
+	       (unsigned long)rx_time);
+        }
 
-#endif // BGKP_METRIC_LOG_ENABLED
+#endif // DUMB_METRIC_LOG_ENABLED
 
     /* DATA needs no extra RSU-side logic beyond ACK + optional log. */
-    if(h.msg_type == BGKP_MSG_DATA) {
+    if(h.msg_type == DUMB_MSG_DATA) {
         return;
     }
 
     /* EMERGENCY decoding + registry update + re-broadcast. */
-    if(h.msg_type == BGKP_MSG_EMERGENCY) {
+    if(h.msg_type == DUMB_MSG_EMERGENCY) {
         int32_t code = -1;
 
         if(pl != NULL && pl_len >= 5) {
@@ -324,14 +327,14 @@ udp_rx_cb(struct simple_udp_connection *c,
                 code = (int32_t)pl[4];
 
                 /* Update registry. */
-                if(code == BGKP_EF_FINISH) {
+                if(code == DUMB_EF_FINISH) {
                     ef_remove(h.origin_id);
-                } else if(code != BGKP_EF_NONE) {
+                } else if(code != DUMB_EF_NONE) {
                     ef_add_or_update(h.origin_id, (uint8_t)code);
                 }
 
                 /* Update last-received placeholder for ACK propagation. */
-                if(code == BGKP_EF_FINISH || code == BGKP_EF_NONE) {
+                if(code == DUMB_EF_FINISH || code == DUMB_EF_NONE) {
                     last_rx_ef_code = 0;
                     last_rx_ef_origin = 0;
                 } else {
@@ -348,15 +351,15 @@ udp_rx_cb(struct simple_udp_connection *c,
 }
 
 
-PROCESS(rsu_process, "BGKP RSU");
+PROCESS(rsu_process, "DUMB RSU");
 AUTOSTART_PROCESSES(&rsu_process);
 
 PROCESS_THREAD(rsu_process, ev, data)
 {
     PROCESS_BEGIN();
 
-    simple_udp_register(&udp, BGKP_UDP_PORT, NULL,
-                        BGKP_UDP_PORT, udp_rx_cb);
+    simple_udp_register(&udp, DUMB_UDP_PORT, NULL,
+                        DUMB_UDP_PORT, udp_rx_cb);
 
     /* Serial line on UART1 (Cooja Serial port) */
     serial_line_init();
@@ -365,13 +368,13 @@ PROCESS_THREAD(rsu_process, ev, data)
     origin_id = (uint32_t)linkaddr_node_addr.u8[7];
     random_init(origin_id);
 
-    bgkp_dedup_init(&dedup);
+    dumb_dedup_init(&dedup);
 
     while(1) {
         PROCESS_YIELD();
 
         if(ev == serial_line_event_message && data) {
-#if BGKP_DIAG
+#if DUMB_DIAG
             printf("RSU_UART: %s\n", (const char *)data);
 #endif
         }
